@@ -22,6 +22,7 @@ import (
 type Dependencies struct {
 	Pool          *pgxpool.Pool
 	WorkerManager *db.WorkerManager
+	Fanout        *db.Fanout
 	Cache         *cache.Cache
 	Config        config.Config
 	Capabilities  *db.Capabilities

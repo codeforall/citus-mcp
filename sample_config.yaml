@@ -13,7 +13,13 @@ coordinator_dsn: postgres://user:password@localhost:5432/mydb?sslmode=disable
 # coordinator_user: myuser
 # coordinator_password: mypassword
 
-# Optional: Direct worker connections (comma-separated)
+# Coordinator-only mode (default: true, recommended for production)
+# When true, worker data is fetched via run_command_on_workers() UDF
+# Set to false only for dev/test with direct worker access
+coordinator_only: true
+
+# Optional: Direct worker connections (dev/test override only)
+# If specified when coordinator_only=true, these take precedence (dev escape hatch)
 # worker_dsns: postgres://user:pass@worker1:5432/db,postgres://user:pass@worker2:5432/db
 
 # ===========================================

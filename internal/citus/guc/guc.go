@@ -322,6 +322,22 @@ var PostgresGUCs = map[string]GUCDef{
 		DefaultValue: "3",
 		Impact:       "Ensure admins can connect during connection exhaustion.",
 	},
+	"max_locks_per_transaction": {
+		Name:           "max_locks_per_transaction",
+		Category:       CategoryConnections,
+		Description:    "Shared lock-table slots per backend (pre-allocated at startup)",
+		DefaultValue:   "64",
+		RecommendedMin: "256",
+		Impact:         "Citus locks every touched shard in one transaction. Metadata sync, rebalance, DDL fan-out and multi-shard updates can exhaust the lock table (error: 'out of shared memory'). Recommended value scales with shard count: 256 for <= 1k shards, 1024 for 1k-10k, 2048+ for > 10k. The lock table sizes as max_locks_per_transaction × MaxBackends × ~270 B of shared memory.",
+		IsCritical:     true,
+	},
+	"max_pred_locks_per_transaction": {
+		Name:         "max_pred_locks_per_transaction",
+		Category:     CategoryConnections,
+		Description:  "Predicate lock slots per backend (SERIALIZABLE only)",
+		DefaultValue: "64",
+		Impact:       "Only relevant under SERIALIZABLE isolation; safe to leave default otherwise.",
+	},
 
 	// Parallelism
 	"max_worker_processes": {

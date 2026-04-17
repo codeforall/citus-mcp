@@ -8,7 +8,8 @@
 
 [![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Citus](https://img.shields.io/badge/Citus-12.x--14.x-336791?logo=postgresql)](https://www.citusdata.com)
+[![Citus](https://img.shields.io/badge/Citus-11.x--14.x-336791?logo=postgresql)](https://www.citusdata.com)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13--17-336791?logo=postgresql)](https://www.postgresql.org)
 
 [Quick Start](#-quick-start) •
 [Features](#-features) •
@@ -48,7 +49,7 @@ Citus MCP is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 
 ### Prerequisites
 
 - **Go 1.23+** (for building from source)
-- **Citus 12.x–14.x** cluster with coordinator access
+- **PostgreSQL 13–17** with the Citus extension (11.x or later) on the coordinator
 - **GitHub Copilot** with MCP support (VS Code or CLI)
 
 ### 1. Build the Server
@@ -255,7 +256,14 @@ coordinator_dsn: postgres://user:password@localhost:5432/mydb?sslmode=disable
 # coordinator_user: myuser
 # coordinator_password: mypassword
 
-# Optional: Direct worker connections (comma-separated)
+# Connection Mode (RECOMMENDED: true for production)
+# --------------------------------------------------
+# When true (default), worker data is fetched via run_command_on_workers() UDF.
+# Set to false only for dev/test with direct worker access.
+coordinator_only: true
+
+# Optional: Direct worker connections (dev/test override only)
+# If specified when coordinator_only=true, these take precedence (dev escape hatch)
 # worker_dsns: postgres://user:pass@worker1:5432/db,postgres://user:pass@worker2:5432/db
 
 # Server Mode
@@ -525,145 +533,389 @@ For SSE/Streamable transports, configure your MCP client to connect via HTTP:
 
 ## 💡 Usage Examples
 
+> The examples below are natural-language prompts you can drop into Copilot
+> Chat (VS Code / CLI). Copilot maps them to the underlying MCP tool call;
+> JSON payloads are shown alongside where useful for automation.
+
 ### Basic Cluster Inspection
 
 ```
-@citus-mcp Show me the cluster summary
+@citus-mcp Give me everything about this cluster
 ```
+→ `citus_cluster_summary` with `{"all": true}` — returns coordinator/worker topology, counts, GUCs, configuration report, and the cross-tool health rollup (memory / connections / drift / metadata-sync / operational).
 
 ```
-@citus-mcp List all distributed tables
+@citus-mcp List all distributed and reference tables
 ```
+→ `citus_list_distributed_tables`, `citus_list_reference_tables`
 
 ```
-@citus-mcp Inspect the public.users table including shards and indexes
+@citus-mcp Inspect the public.orders table including shards and indexes
 ```
+→ `citus_table_inspector` with `{"table":"public.orders","include_shards":true,"include_indexes":true}`
 
 ### Monitoring
 
 ```
 @citus-mcp Show current cluster activity
-```
-
-```
-@citus-mcp Are there any lock waits in the cluster?
-```
-
-```
+@citus-mcp Are there any lock waits right now?
 @citus-mcp Show background job progress
+@citus-mcp Proactive health dashboard for the cluster
 ```
+→ `citus_activity`, `citus_lock_inspector`, `citus_job_inspector`, `citus_proactive_health`
 
-### Analysis
-
-```
-@citus-mcp Analyze shard skew for the orders table
-```
+### Memory & Capacity Planning
 
 ```
-@citus-mcp Show me the shard heatmap grouped by node
+@citus-mcp Project per-backend Citus metadata cache memory
 ```
+→ `citus_metadata_cache_footprint` — size of `MetadataCacheMemoryContext` per backend based on current shape.
 
 ```
-@citus-mcp Explain this query: SELECT * FROM orders WHERE customer_id = 123
+@citus-mcp Estimate PG CacheMemoryContext footprint on the coordinator and each worker
 ```
-
-### Advisor
-
-```
-@citus-mcp Run the advisor with focus on skew
-```
+→ `citus_pg_cache_footprint` — relcache/catcache/plancache estimates.
 
 ```
-@citus-mcp Check operational health (long queries, locks, jobs)
+@citus-mcp Is the cluster close to OOM? Use worst_case=true and 64 GiB per node
 ```
+→ `citus_memory_risk_report` with `{"worst_case":true, "node_ram_bytes":68719476736}` — 13-term budget (shared_buffers, wal_buffers, lock/pred-lock tables, WAL senders, logical decoding, bgworker baselines, per-backend process baseline + plan cache, Citus metadata + PG CacheMemoryContext, `work_mem × hash_mem_multiplier × (1 + parallel_workers_per_gather) × plan_ops_per_query`, temp_buffers, autovacuum, coord↔worker libpq buffers) compared against node RAM.
 
 ```
-@citus-mcp Suggest the best source node for snapshot-based scaling
+@citus-mcp Sample PostgreSQL MemoryContextStats on every node
 ```
+→ `citus_worker_memcontexts` — live `pg_get_backend_memory_contexts()` fan-out across the cluster.
 
 ```
-@citus-mcp Check metadata health with deep validation across nodes
+@citus-mcp What will happen to memory if I double the number of monthly partitions?
 ```
-
-### Configuration Analysis
-
-```
-@citus-mcp Analyze cluster configuration and recommend improvements
-```
+→ `citus_partition_growth_simulator` with `{"partitions_per_parent":24}`
 
 ```
-@citus-mcp Run config advisor with focus on memory settings
+@citus-mcp How many clients can each node handle? Compare coord-only, MX, and PgBouncer
 ```
-
-### Colocation Analysis
-
-```
-@citus-mcp Show all colocation groups
-```
+→ `citus_connection_capacity` — returns effective max client backends under each deployment mode plus bottleneck explanation.
 
 ```
-@citus-mcp Which tables are colocated with the orders table?
+@citus-mcp Simulate 400 concurrent multi-shard queries and tell me when max_shared_pool_size saturates
 ```
+→ `citus_connection_fanout_simulator` with `{"concurrent_clients":400}`
 
-### Node Addition
+```
+@citus-mcp Should I use PgBouncer session or transaction mode with this workload?
+```
+→ `citus_pooler_advisor`
 
 ```
-@citus-mcp Run pre-flight checks for adding node at postgres://user:pass@newworker:5432/db
+@citus-mcp Size hardware for 5× projected load: 50k IOPS, 2 TB data, 200 active clients
 ```
+→ `citus_hardware_sizer` with `{"projected_data_gb":2000,"projected_active_clients":200,"projected_iops":50000}`
+
+```
+@citus-mcp Is 32 shards the right number? Chart the trade-offs
+```
+→ `citus_shardcount_tradeoff_chart`
+
+### MX & Node Addition
+
+```
+@citus-mcp Run pre-flight checks for adding a worker at newworker.prod:5432
+```
+→ `citus_add_node_preflight` with `{"host":"newworker.prod","port":5432}` — coordinator-side checklist (extensions, types, schemas, roles, version match, `max_locks_per_transaction`/`max_worker_processes`/`max_connections` floors, `wal_level=logical`, replication slots).
+
+```
+@citus-mcp Advise how to prepare newworker.prod:5432 before I call citus_add_node and generate a shell script
+```
+→ `citus_node_prepare_advisor` with `{"host":"newworker.prod","port":5432,"generate_script":true}`
+
+```
+@citus-mcp Will metadata sync succeed on the new node, or should I use nontransactional mode? Target has 16 GiB RAM
+```
+→ `citus_metadata_sync_risk` with `{"target_node_ram_gib":16}` — DDL count, locks-in-tx, duration, timeout correlations.
+
+```
+@citus-mcp Is the cluster ready for MX with 2 concurrent queries per peer and new nodes sized at max_connections=300?
+```
+→ `citus_mx_readiness` with `{"concurrent_queries_per_peer":2,"new_node_max_connections":300,"expected_clients_per_node":100}`
+
+```
+@citus-mcp Which existing worker should I snapshot from when adding a new one?
+```
+→ `citus_snapshot_source_advisor`
+
+### Metadata, Extensions & Routing
+
+```
+@citus-mcp Deep metadata consistency check across every node
+```
+→ `citus_metadata_health` with `{"check_level":"deep","include_fixes":true}`
+
+```
+@citus-mcp Are all extensions at the same version on every node?
+```
+→ `citus_extension_drift_scanner`
+
+```
+@citus-mcp Measure planner overhead across the cluster
+```
+→ `citus_planner_overhead_probe`
+
+```
+@citus-mcp Detect routing drift — are any queries landing on the wrong shard?
+```
+→ `citus_routing_drift_detector`
+
+```
+@citus-mcp Run a synthetic probe to validate end-to-end correctness
+```
+→ `citus_synthetic_probe`
+
+```
+@citus-mcp Dump the session's active guardrails (statement timeout, read-only, row caps)
+```
+→ `citus_session_guardrails`
+
+### Advisors (Read-Only Recommendations)
+
+```
+@citus-mcp Run the Citus advisor focused on skew and include SQL fixes
+```
+→ `citus_advisor` with `{"focus":"skew","include_sql_fixes":true}`
+
+```
+@citus-mcp Analyze configuration, all categories, warn level and above
+```
+→ `citus_config_advisor` with `{"severity_filter":"warning"}`
+
+```
+@citus-mcp Deep inspection of PostgreSQL + Citus GUCs
+```
+→ `citus_config_deep_inspect`
+
+```
+@citus-mcp Advise on shard count per distributed table given current/projected load
+```
+→ `citus_shard_advisor`
+
+```
+@citus-mcp Which tables would benefit from columnar storage?
+```
+→ `citus_columnar_advisor`
+
+```
+@citus-mcp Show risky tenants (heavy shards, hot locks, outsized query share)
+```
+→ `citus_tenant_risk`
+
+```
+@citus-mcp Investigate which queries are pathological (cross-shard joins, broadcasts, repartitions)
+```
+→ `citus_query_pathology`
+
+```
+@citus-mcp Inspect the connected PgBouncer for pool health
+```
+→ `citus_pgbouncer_inspector`
+
+### Shard & Skew Analysis
+
+```
+@citus-mcp Skew report for the orders table by row count
+@citus-mcp Heatmap of the hottest shards in the last interval
+```
+→ `citus_shard_skew_report`, `citus_shard_heatmap`
+
+```
+@citus-mcp Estimate the cost (time, WAL, bytes) of rebalancing the current cluster
+```
+→ `citus_rebalance_cost_estimator`
+
+### Time-Series / Snapshots
+
+```
+@citus-mcp Record a snapshot named pre-deploy-2026-04
+@citus-mcp List snapshots taken in the last 30 days
+@citus-mcp Trend query latency over the last 7 days
+@citus-mcp Detect regressions against the pre-deploy-2026-04 snapshot
+@citus-mcp Project 12-month growth from snapshots
+@citus-mcp What changed between snapshots A and B?
+```
+→ `citus_snapshot_record`, `citus_snapshot_list`, `citus_trend`, `citus_regression_detect`, `citus_growth_projection`, `citus_what_changed`
+
+### Alarms
+
+```
+@citus-mcp List open alarms
+@citus-mcp Acknowledge alarm abc-123
+@citus-mcp Clear all resolved alarms older than 7 days
+```
+→ `citus_alarms_list`, `citus_alarms_ack`, `citus_alarms_clear`
+
+### Execute Operations (Approval Required)
+
+```
+@citus-mcp Plan a rebalance limited to 10 shard moves
+@citus-mcp Request an approval token for rebalance
+@citus-mcp Execute rebalance with token <token>
+@citus-mcp Check rebalance status
+```
+→ `citus_rebalance_plan` → `citus_request_approval_token` → `citus_rebalance_execute` → `citus_rebalance_status`
+
+```
+@citus-mcp Move shard 102008 from 10.0.0.5:5432 to 10.0.0.6:5432
+```
+→ `citus_move_shard_plan` + `citus_move_shard_execute` (with approval token)
+
+```
+@citus-mcp Isolate tenant 42 to its own shard
+@citus-mcp Clean up orphaned shard placements left by a failed move
+```
+→ `citus_isolate_tenant`, `citus_cleanup_orphaned`
 
 ---
 
 ## 📚 Tools Reference
 
-### Inspection Tools
+All tool names below can be invoked directly as MCP tool calls. Most
+accept an optional object with the listed parameters; `—` means the tool
+takes no input.
+
+### 🧭 Reports & Covering Tools
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
-| `ping` | `message?` | Health check |
-| `server_info` | — | Server metadata and mode |
-| `list_nodes` | `limit?`, `offset?` | Coordinator and workers |
-| `list_distributed_tables` | `limit?`, `offset?` | All distributed tables |
+| `citus_full_report` | `partition_growth_factor?`, `memory_budget_bytes?`, `include_verbose_outputs?`, `synthetic_probe?`, `pgbouncer_admin_dsn?`, `hardware_sizer_targets?` | Single covering tool. Runs every read-only diagnostic + advisor (~30 tools) and produces one consolidated report with overall health, top findings, top recommendations, and per-tool sections. Execute-class and input-specific tools are intentionally excluded. |
+
+**Example — `citus_full_report`:**
+
+```jsonc
+// Default invocation: runs all read-only diagnostics with sensible defaults
+{}
+
+// With partition what-if and a tighter memory budget
+{
+  "partition_growth_factor": 2.0,
+  "memory_budget_bytes": 4294967296
+}
+
+// Include optional synthetic probe + raw per-tool outputs (verbose)
+{
+  "synthetic_probe": true,
+  "include_verbose_outputs": true
+}
+```
+
+### Core Inspection (read-only)
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `ping` | `message?` | Liveness check |
+| `server_info` | — | Server metadata, build info, mode |
+| `list_nodes` | `limit?`, `offset?` | Coordinator + workers |
+| `list_distributed_tables` | `limit?`, `offset?` | Legacy table listing |
 | `list_shards` | `limit?`, `offset?` | Shards with placements |
-| `citus_cluster_summary` | `include_workers?`, `include_gucs?`, `include_config?` | Full cluster overview with config health |
-| `citus_list_distributed_tables` | `schema?`, `table_type?`, `limit?`, `cursor?` | Paginated table list |
-| `citus_list_reference_tables` | `schema?`, `limit?`, `cursor?` | Paginated reference table list |
-| `citus_table_inspector` | `table` (required), `include_shards?`, `include_indexes?` | Table deep dive |
-| `citus_colocation_inspector` | `colocation_id?`, `limit?` | Colocation groups |
+| `citus_cluster_summary` | `all?`, `include_workers?`, `include_gucs?`, `include_config?`, `include_health?`, `include_operational?` | Full cluster overview; `all: true` enables every section including the cross-tool health rollup |
+| `citus_list_distributed_tables` | `schema?`, `table_type?`, `limit?`, `cursor?` | Paginated distributed-table list |
+| `citus_list_reference_tables` | `schema?`, `limit?`, `cursor?` | Paginated reference-table list |
+| `citus_table_inspector` | `table` *(req)*, `include_shards?`, `include_indexes?` | Table deep-dive |
+| `citus_colocation_inspector` | `colocation_id?`, `limit?` | Colocation groups + members |
 
-### Monitoring Tools
+### Monitoring & Activity
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
-| `citus_activity` | `limit?`, `include_idle?`, `min_duration_secs?` | Active queries |
-| `citus_lock_inspector` | `include_locks?`, `limit?` | Lock waits |
-| `citus_job_inspector` | `state?`, `include_tasks?`, `limit?` | Background jobs |
-| `citus_shard_heatmap` | `table?`, `limit?`, `metric?`, `group_by?` | Hot shards |
+| `citus_activity` | `limit?`, `include_idle?`, `min_duration_secs?` | Cluster-wide active queries |
+| `citus_lock_inspector` | `include_locks?`, `limit?` | Lock waits and blockers |
+| `citus_job_inspector` | `state?`, `include_tasks?`, `limit?` | Background-job progress |
+| `citus_shard_heatmap` | `table?`, `metric?`, `group_by?`, `limit?` | Hot-shard map |
 | `citus_shard_skew_report` | `table?`, `metric?`, `include_top_shards?` | Skew analysis |
-| `citus_explain_query` | `sql` (required), `analyze?`, `verbose?`, `costs?` | EXPLAIN query |
+| `citus_explain_query` | `sql` *(req)*, `analyze?`, `verbose?`, `costs?` | Distributed EXPLAIN |
+| `citus_proactive_health` | `long_tx_seconds?`, `idle_in_tx_seconds?`, `stuck_prepared_xact_seconds?`, `bloat_*?`, `include_workers?` | Long-tx / 2PC / bloat / saturation dashboard |
 
-### Advisor Tools
+### Memory & Capacity Planning
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
-| `citus_advisor` | `focus?` (`skew`/`ops`), `max_tables?`, `include_next_steps?`, `include_sql_fixes?` | SRE advisor |
+| `citus_metadata_cache_footprint` | `typical_tables_touched?`, `hot_path_tables_touched?`, `memory_budget_bytes?`, `partition_growth_factor?`, `skip_worst_case_scan?`, `skip_query_correlation?` | Three-regime per-backend Citus metadata cache estimate (typical/hot-path/worst-case), concurrent-cap headroom, live worst-case backend detection, partition-explosion simulator, pg_stat_statements query correlation |
+| `citus_pg_cache_footprint` | `include_shard_rels?` | Per-backend PG CacheMemoryContext estimate |
+| `citus_worker_memcontexts` | `top_n?` | `pg_get_backend_memory_contexts()` fan-out |
+| `citus_partition_growth_simulator` | `partitions_per_parent`, `period_days?` | Projects cache cost of adding partitions |
+| `citus_memory_risk_report` | `node_ram_bytes?`, `node_ram_bytes_by_node?`, `worst_case?`, `warn_pct?`, `crit_pct?`, `include_coordinator?`, `per_backend_app_overhead_bytes?`, `plan_ops_per_query?` | OOM risk rollup per node — 13 consumer terms: shared_buffers, wal_buffers, lock_table (`max_locks_per_transaction × MaxBackends × 270 B`), pred_lock_table, prepared_xact_state, wal_senders, logical_decoding, bgworker_baseline, backend_process_baseline, per_backend_caches (Citus MetadataCache + PG CacheMemoryContext), work_mem_peak (applies `hash_mem_multiplier` + `max_parallel_workers_per_gather` + `plan_ops_per_query`), temp_buffers, autovacuum_budget, plus coord↔worker libpq connection buffers on the coordinator. |
+| `citus_connection_capacity` | `safety_fraction?`, `per_backend_override?`, `include_coordinator?` | Effective client max per deployment mode |
+| `citus_connection_fanout_simulator` | `concurrent_clients`, `peer_count?` | Simulates `max_adaptive × peers × clients` pressure |
+| `citus_pooler_advisor` | `expected_clients?`, `mode?` | PgBouncer session vs transaction guidance |
+| `citus_hardware_sizer` | `projected_data_gb?`, `projected_active_clients?`, `projected_iops?`, `retention_days?` | Hardware sizing for current/projected load |
+| `citus_shardcount_tradeoff_chart` | `table?`, `candidate_counts?` | Shard-count trade-off chart |
+
+### MX / Node Addition
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `citus_add_node_preflight` | `host` *(req)*, `port?`, `database?` | Coordinator-side checklist for adding a worker |
+| `citus_node_prepare_advisor` | `host` *(req)*, `port?`, `database?`, `generate_script?` | Preparation steps + optional shell script |
+| `citus_metadata_sync_risk` | `target_max_locks_per_transaction?`, `target_node_ram_gib?`, `assume_sync_mode?` | Estimates `citus_activate_node` work and timeout/OOM/lock risks. Returns `recommended_max_locks_per_transaction` (concrete multiple-of-64 value) when current setting would exhaust the shared lock table, plus the exact `ALTER SYSTEM SET …` statement in `recommendations[]`. |
+| `citus_mx_readiness` | `expected_clients_per_node?`, `target_node_ram_gib?`, `new_node_max_connections?`, `concurrent_queries_per_peer?` | Mesh-connection budgeting before MX |
+| `citus_snapshot_source_advisor` | `strategy?`, `max_candidates?`, `include_simulation?` | Picks best source worker for snapshot-based add |
+
+### Metadata / Extensions / Routing
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `citus_metadata_health` | `check_level?` (`basic`/`thorough`/`deep`), `include_fixes?` | Cross-node metadata consistency |
+| `citus_extension_drift_scanner` | `extensions?` | Version/availability drift across nodes |
+| `citus_planner_overhead_probe` | `iterations?` | Planner-time measurement |
+| `citus_routing_drift_detector` | `sample_size?` | Detects queries routing to unexpected shards |
+| `citus_synthetic_probe` | `verbose?` | End-to-end synthetic correctness probe |
+| `citus_session_guardrails` | — | Active guardrail settings on current session |
+
+### Advisors (read-only)
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `citus_advisor` | `focus?` (`skew`/`ops`), `max_tables?`, `include_next_steps?`, `include_sql_fixes?` | Top-level SRE advisor |
 | `citus_config_advisor` | `include_all_gucs?`, `category?`, `severity_filter?`, `total_ram_gb?` | Configuration analysis |
-| `citus_snapshot_source_advisor` | `strategy?`, `max_candidates?`, `include_simulation?` | Node addition advice |
-| `citus_validate_rebalance_prereqs` | `table` (required) | Rebalance readiness |
-| `citus_metadata_health` | `check_level?` (`basic`/`thorough`/`deep`), `include_fixes?` | Metadata consistency checks |
-| `citus_node_prepare_advisor` | `host` (required), `port?`, `database?`, `generate_script?` | Pre-flight node addition checks |
+| `citus_config_deep_inspect` | — | Full PG + Citus GUC deep dive |
+| `citus_shard_advisor` | `table?`, `projected_load_multiplier?` | Shard-count recommendation |
+| `citus_columnar_advisor` | — | Columnar-storage candidates |
+| `citus_tenant_risk` | `top_n?` | Risky tenants |
+| `citus_query_pathology` | `limit?`, `window_secs?` | Pathological distributed queries |
+| `citus_pgbouncer_inspector` | `dsn?` | Connected PgBouncer diagnostics |
+| `citus_rebalance_cost_estimator` | `table?`, `strategy?` | Estimates rebalance cost (time, WAL, bytes) |
+| `citus_validate_rebalance_prereqs` | `table` *(req)* | Rebalance readiness checklist |
 
-### Execute Tools (Require Approval)
+### Alarms
 
 | Tool | Parameters | Description |
 |------|------------|-------------|
+| `citus_alarms_list` | `kind?`, `severity?`, `acked?`, `limit?` | List alarms emitted by other tools |
+| `citus_alarms_ack` | `id` *(req)* | Acknowledge |
+| `citus_alarms_clear` | `older_than_seconds?`, `kind?` | Bulk clear |
+
+### Time-Series / Snapshots
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `citus_snapshot_record` | `name?`, `tags?` | Record a snapshot (opt-in SQLite) |
+| `citus_snapshot_list` | `limit?`, `since?` | List snapshots |
+| `citus_trend` | `metric` *(req)*, `window_days?` | Trend line for a metric |
+| `citus_regression_detect` | `baseline` *(req)* | Compare against a baseline snapshot |
+| `citus_growth_projection` | `metric` *(req)*, `horizon_months?` | Linear/exponential projection |
+| `citus_what_changed` | `a` *(req)*, `b` *(req)* | Diff between two snapshots |
+
+### Execute Operations (require approval token)
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `citus_request_approval_token` | `action` *(req)*, `ttl_seconds?` | HMAC-signed approval token |
 | `citus_rebalance_plan` | `table?`, `threshold?`, `max_shard_moves?`, `drain_only?` | Preview rebalance |
-| `citus_rebalance_execute` | `approval_token` (required), `table?`, `threshold?` | Start rebalance |
+| `citus_rebalance_execute` | `approval_token` *(req)*, `table?`, `threshold?` | Start rebalance |
 | `citus_rebalance_status` | `verbose?`, `limit?`, `cursor?` | Rebalance progress |
-| `citus_move_shard_plan` | `shard_id`, `source_host`, `source_port`, `target_host`, `target_port`, `colocated?` | Preview move |
-| `citus_move_shard_execute` | `approval_token` (required), `shard_id`, `source_*`, `target_*`, `colocated?`, `drop_method?` | Execute move |
-| `citus_request_approval_token` | `action` (required), `ttl_seconds?` | Get approval token |
-| `rebalance_table_plan` | `table` (required) | Legacy: plan table rebalance |
-| `rebalance_table_execute` | `table` (required), `approval_token` (required) | Legacy: execute table rebalance |
+| `citus_move_shard_plan` | `shard_id`, `source_host`, `source_port`, `target_host`, `target_port`, `colocated?` | Preview shard move |
+| `citus_move_shard_execute` | `approval_token` *(req)*, `shard_id`, `source_*`, `target_*`, `colocated?`, `drop_method?` | Execute shard move |
+| `citus_isolate_tenant` | `approval_token` *(req)*, `table`, `tenant_id` | Isolate tenant to its own shard |
+| `citus_cleanup_orphaned` | `approval_token` *(req)*, `dry_run?` | Clean up orphaned placements |
+| `rebalance_table_plan` | `table` *(req)* | Legacy per-table rebalance plan |
+| `rebalance_table_execute` | `table` *(req)*, `approval_token` *(req)* | Legacy per-table rebalance execute |
 
 ---
 
@@ -782,7 +1034,7 @@ citus-mcp/
 ├── cmd/citus-mcp/       # Main entry point
 ├── internal/
 │   ├── mcpserver/       # MCP server implementation
-│   │   ├── tools/       # Tool implementations (30+ tools)
+│   │   ├── tools/       # Tool implementations (68 tools)
 │   │   ├── prompts/     # Prompt templates
 │   │   └── resources/   # Static resources
 │   ├── db/              # Database layer and worker management

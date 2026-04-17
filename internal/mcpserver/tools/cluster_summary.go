@@ -13,6 +13,7 @@ import (
 
 	"citus-mcp/internal/citus/guc"
 	"citus-mcp/internal/db"
+	"citus-mcp/internal/diagnostics"
 	serr "citus-mcp/internal/errors"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.uber.org/zap"
@@ -20,19 +21,105 @@ import (
 
 // ClusterSummaryInput defines input for citus_cluster_summary.
 type ClusterSummaryInput struct {
-	IncludeWorkers bool `json:"include_workers,omitempty"`
-	IncludeGUCs    bool `json:"include_gucs,omitempty"`
-	IncludeConfig  bool `json:"include_config,omitempty"`
+	IncludeWorkers     bool `json:"include_workers,omitempty"`
+	IncludeGUCs        bool `json:"include_gucs,omitempty"`
+	IncludeConfig      bool `json:"include_config,omitempty"`
+	// IncludeHealth adds a compact roll-up of memory pressure, effective
+	// connection capacity, extension drift and metadata sync status by
+	// delegating to the respective tools. Costs ~3 coordinator queries +
+	// a handful of fanouts.
+	IncludeHealth bool `json:"include_health,omitempty"`
+	// IncludeOperational additionally runs the proactive-health probe
+	// (long transactions, stuck 2PC, bloat candidates). Requires
+	// IncludeHealth=true. More expensive; off by default.
+	IncludeOperational bool `json:"include_operational,omitempty"`
+	// All turns on every optional section (workers, GUCs, config, health,
+	// operational) — the "give me everything" switch. Overrides the
+	// per-section flags.
+	All bool `json:"all,omitempty"`
 }
 
 // ClusterSummaryOutput defines output structure.
 type ClusterSummaryOutput struct {
-	Coordinator   CoordinatorSummary   `json:"coordinator"`
-	Workers       []WorkerSummary      `json:"workers,omitempty"`
-	Counts        CountsSummary        `json:"counts"`
-	Warnings      []string             `json:"warnings,omitempty"`
-	GUCs          map[string]string    `json:"gucs,omitempty"`
-	Configuration *ConfigurationReport `json:"configuration,omitempty"`
+	Coordinator   CoordinatorSummary     `json:"coordinator"`
+	Workers       []WorkerSummary        `json:"workers,omitempty"`
+	Counts        CountsSummary          `json:"counts"`
+	Warnings      []string               `json:"warnings,omitempty"`
+	GUCs          map[string]string      `json:"gucs,omitempty"`
+	Configuration *ConfigurationReport   `json:"configuration,omitempty"`
+	Health        *ClusterHealthSummary  `json:"health,omitempty"`
+}
+
+// ClusterHealthSummary rolls up the outputs of the dedicated diagnostics
+// tools into a glanceable status. Each sub-section is populated from the
+// existing tool; fields are omitted when the corresponding probe fails so
+// the summary stays useful even on partial failures.
+type ClusterHealthSummary struct {
+	OverallHealth string                      `json:"overall_health"` // ok | warning | critical | unknown
+	Memory        *HealthMemorySection        `json:"memory,omitempty"`
+	MetadataCache *HealthMetadataCacheSection `json:"metadata_cache,omitempty"`
+	Connections   *HealthConnectionsSection   `json:"connections,omitempty"`
+	Drift         *HealthDriftSection         `json:"drift,omitempty"`
+	MetadataSync  *HealthMetadataSyncSection  `json:"metadata_sync,omitempty"`
+	Operational   *HealthOperationalSection   `json:"operational,omitempty"`
+	Errors        []string                    `json:"errors,omitempty"`
+}
+
+type HealthMemorySection struct {
+	HottestNode   string  `json:"hottest_node,omitempty"`
+	HighestRiskPct float64 `json:"highest_risk_pct,omitempty"`
+	OpenAlarms    int     `json:"open_alarms"`
+	Status        string  `json:"status"` // ok | warning | critical | unknown
+}
+
+// HealthMetadataCacheSection surfaces the three-regime Citus MetadataCache
+// view (typical / hot_path / worst_case) plus the concurrent worst-case cap.
+// Populated by MetadataCacheFootprintTool.
+type HealthMetadataCacheSection struct {
+	TypicalBytes           int64  `json:"typical_per_backend_bytes,omitempty"`
+	HotPathBytes           int64  `json:"hot_path_per_backend_bytes,omitempty"`
+	WorstCaseBytes         int64  `json:"worst_case_per_backend_bytes"`
+	ProjectedAtMaxConnBytes int64 `json:"worst_case_at_max_connections_bytes"`
+	MaxConcurrent          int    `json:"max_concurrent_worst_case,omitempty"`
+	HeadroomConnections    int    `json:"headroom_connections,omitempty"`
+	CurrentWorstBackends   int    `json:"current_worst_case_backends"`
+	BudgetSource           string `json:"budget_source,omitempty"`
+	OpenAlarms             int    `json:"open_alarms"`
+	Status                 string `json:"status"`
+}
+
+type HealthConnectionsSection struct {
+	CoordinatorOnlyMax int    `json:"coordinator_only_client_max"`
+	MXMax              int    `json:"mx_client_max"`
+	PgBouncerTxnMax    int    `json:"pgbouncer_txn_client_max"`
+	Bottleneck         string `json:"bottleneck,omitempty"`
+	OpenAlarms         int    `json:"open_alarms"`
+	Status             string `json:"status"`
+}
+
+type HealthDriftSection struct {
+	ExtensionIssues int    `json:"extension_issues"`
+	OpenAlarms      int    `json:"open_alarms"`
+	Status          string `json:"status"`
+}
+
+type HealthMetadataSyncSection struct {
+	Verdict       string `json:"verdict"` // ok | nontransactional_recommended | blocked
+	EstimatedDDL  int    `json:"estimated_ddl_commands"`
+	EstimatedSec  int    `json:"estimated_duration_sec"`
+	OpenAlarms    int    `json:"open_alarms"`
+	Status        string `json:"status"`
+}
+
+type HealthOperationalSection struct {
+	LongTx                int    `json:"long_tx_count"`
+	IdleInTx              int    `json:"idle_in_tx_count"`
+	StuckPreparedXact     int    `json:"stuck_prepared_xact_count"`
+	UnhealthyPlacements   int    `json:"unhealthy_placement_count"`
+	SaturatedNodes        int    `json:"saturated_node_count"`
+	BloatCandidates       int    `json:"bloat_candidate_count"`
+	StaleAutovacuum       int    `json:"stale_autovacuum_count"`
+	OverallHealth         string `json:"overall_health"`
 }
 
 // ConfigurationReport provides a summary of important configuration settings.
@@ -76,6 +163,14 @@ type CountsSummary struct {
 }
 
 func clusterSummaryTool(ctx context.Context, deps Dependencies, input ClusterSummaryInput) (*mcp.CallToolResult, ClusterSummaryOutput, error) {
+	// "all" expands to every optional section.
+	if input.All {
+		input.IncludeWorkers = true
+		input.IncludeGUCs = true
+		input.IncludeConfig = true
+		input.IncludeHealth = true
+		input.IncludeOperational = true
+	}
 	// defaults - include workers and config by default
 	if !input.IncludeWorkers {
 		input.IncludeWorkers = true
@@ -134,6 +229,11 @@ func clusterSummaryTool(ctx context.Context, deps Dependencies, input ClusterSum
 		warnings = append(warnings, configWarnings...)
 	}
 
+	// Include cross-tool health roll-up.
+	if input.IncludeHealth {
+		out.Health = buildClusterHealth(ctx, deps, input.IncludeOperational)
+	}
+
 	if len(warnings) > 0 {
 		out.Warnings = warnings
 	}
@@ -187,21 +287,28 @@ func fetchWorkers(ctx context.Context, deps Dependencies) ([]WorkerSummary, []st
 		return workers[i].Host < workers[j].Host
 	})
 
-	// mixed worker versions (best-effort)
-	if pools, infos2, err := deps.WorkerManager.Pools(ctx); err == nil {
-		versions := map[string]struct{}{}
-		for id, pool := range pools {
-			if pool == nil {
-				continue
-			}
-			if _, ok := workerInfoByID(infos2, id); ok {
-				if v, err := db.GetServerInfo(ctx, pool); err == nil {
-					versions[v.PostgresVersion+"|"+v.CitusVersion] = struct{}{}
+	// mixed worker versions (best-effort) - use Fanout
+	if deps.Fanout != nil {
+		versionSQL := `SELECT version() AS version, (SELECT extversion FROM pg_extension WHERE extname='citus') AS citus_version`
+		if results, err := deps.Fanout.OnWorkers(ctx, versionSQL); err == nil {
+			versions := map[string]struct{}{}
+			for _, res := range results {
+				if !res.Success || len(res.Rows) == 0 {
+					continue
 				}
+				pgVer := ""
+				citusVer := ""
+				if v, ok := res.Rows[0]["version"].(string); ok {
+					pgVer = v
+				}
+				if v, ok := res.Rows[0]["citus_version"].(string); ok {
+					citusVer = v
+				}
+				versions[pgVer+"|"+citusVer] = struct{}{}
 			}
-		}
-		if len(versions) > 1 {
-			warnings = append(warnings, "mixed worker versions")
+			if len(versions) > 1 {
+				warnings = append(warnings, "mixed worker versions")
+			}
 		}
 	}
 
@@ -456,4 +563,198 @@ func buildConfigSummary(citusGUCs, postgresGUCs map[string]guc.GUCValue, workerC
 	}
 
 	return strings.Join(parts, ". ") + "."
+}
+
+// buildClusterHealth delegates to the dedicated diagnostic tools and
+// collapses their outputs into the compact ClusterHealthSummary. Errors
+// from individual probes are recorded in Health.Errors so the rest of the
+// summary still renders.
+func buildClusterHealth(ctx context.Context, deps Dependencies, includeOperational bool) *ClusterHealthSummary {
+h := &ClusterHealthSummary{OverallHealth: "ok", Errors: []string{}}
+
+// Memory risk roll-up.
+if _, memOut, err := MemoryRiskReportTool(ctx, deps, MemoryRiskInput{}); err != nil {
+h.Errors = append(h.Errors, "memory_risk: "+err.Error())
+} else {
+sec := &HealthMemorySection{Status: "ok"}
+for _, n := range memOut.Nodes {
+if n.RiskPct > sec.HighestRiskPct {
+sec.HighestRiskPct = n.RiskPct
+sec.HottestNode = fmt.Sprintf("%s:%d", n.NodeName, n.NodePort)
+}
+}
+sec.OpenAlarms = len(memOut.Alarms)
+if sec.HighestRiskPct >= 0.95 || hasCritical(memOut.Alarms) {
+sec.Status = "critical"
+} else if sec.HighestRiskPct >= 0.80 || len(memOut.Alarms) > 0 {
+sec.Status = "warning"
+}
+if sec.HighestRiskPct == 0 && len(memOut.Nodes) == 0 {
+sec.Status = "unknown"
+}
+h.Memory = sec
+}
+
+// Metadata cache footprint roll-up: surfaces the three scenarios + concurrent cap.
+if _, mcOut, err := MetadataCacheFootprintTool(ctx, deps, MetadataCacheFootprintInput{}); err != nil {
+h.Errors = append(h.Errors, "metadata_cache_footprint: "+err.Error())
+} else {
+sec := &HealthMetadataCacheSection{
+WorstCaseBytes:          mcOut.Estimate.Bytes,
+ProjectedAtMaxConnBytes: mcOut.ProjectedCluster.MaxConnectionBytes,
+CurrentWorstBackends:    len(mcOut.WorstCaseBackends),
+OpenAlarms:              len(mcOut.Alarms),
+Status:                  "ok",
+}
+if mcOut.Scenarios != nil {
+sec.TypicalBytes = mcOut.Scenarios.Typical.PerBackendBytes
+sec.HotPathBytes = mcOut.Scenarios.HotPath.PerBackendBytes
+}
+if mcOut.ConcurrentCap != nil {
+sec.MaxConcurrent = mcOut.ConcurrentCap.MaxConcurrent
+sec.HeadroomConnections = mcOut.ConcurrentCap.HeadroomConnections
+sec.BudgetSource = mcOut.ConcurrentCap.BudgetSource
+}
+switch {
+case hasCritical(mcOut.Alarms):
+sec.Status = "critical"
+case mcOut.ConcurrentCap != nil && mcOut.ConcurrentCap.HeadroomConnections < 0 && mcOut.ConcurrentCap.BudgetSource != "unavailable":
+sec.Status = "critical"
+case len(mcOut.WorstCaseBackends) > 0:
+sec.Status = "warning"
+case len(mcOut.Alarms) > 0:
+sec.Status = "warning"
+}
+h.MetadataCache = sec
+}
+
+// Connection capacity roll-up.
+if _, capOut, err := ConnectionCapacityTool(ctx, deps, ConnectionCapacityInput{}); err != nil {
+h.Errors = append(h.Errors, "connection_capacity: "+err.Error())
+} else {
+sec := &HealthConnectionsSection{
+CoordinatorOnlyMax: capOut.CoordinatorOnly.RecommendedClientMax,
+MXMax:              capOut.MXMode.RecommendedClientMax,
+PgBouncerTxnMax:    capOut.PgBouncerTxn.RecommendedClientMax,
+Bottleneck:         capOut.CoordinatorOnly.Bottleneck,
+OpenAlarms:         len(capOut.Alarms),
+Status:             "ok",
+}
+if hasCritical(capOut.Alarms) {
+sec.Status = "critical"
+} else if len(capOut.Alarms) > 0 {
+sec.Status = "warning"
+}
+h.Connections = sec
+}
+
+// Extension / version drift.
+if _, drOut, err := ExtensionDriftScannerTool(ctx, deps, ExtensionDriftInput{}); err != nil {
+h.Errors = append(h.Errors, "extension_drift: "+err.Error())
+} else {
+drifted := 0
+for _, rep := range drOut.Reports {
+if rep.Drifted {
+drifted++
+}
+}
+sec := &HealthDriftSection{
+ExtensionIssues: drifted,
+OpenAlarms:      len(drOut.Alarms),
+Status:          "ok",
+}
+if hasCritical(drOut.Alarms) {
+sec.Status = "critical"
+} else if len(drOut.Alarms) > 0 || drifted > 0 {
+sec.Status = "warning"
+}
+h.Drift = sec
+}
+
+// Metadata sync readiness (advisory — always safe to run).
+if _, msOut, err := MetadataSyncRiskTool(ctx, deps, MetadataSyncRiskInput{}); err != nil {
+h.Errors = append(h.Errors, "metadata_sync_risk: "+err.Error())
+} else {
+sec := &HealthMetadataSyncSection{
+Verdict:      msOut.Verdict,
+EstimatedDDL: msOut.EstimatedDDLCommands,
+EstimatedSec: msOut.EstimatedDurationSec,
+OpenAlarms:   len(msOut.Alarms),
+Status:       "ok",
+}
+switch msOut.Verdict {
+case "blocked":
+sec.Status = "critical"
+case "nontransactional_recommended":
+sec.Status = "warning"
+}
+h.MetadataSync = sec
+}
+
+// Operational dashboard (opt-in).
+if includeOperational {
+if _, opOut, err := ProactiveHealthTool(ctx, deps, ProactiveHealthInput{}); err != nil {
+h.Errors = append(h.Errors, "proactive_health: "+err.Error())
+} else {
+h.Operational = &HealthOperationalSection{
+LongTx:              opOut.Summary.LongTxCount,
+IdleInTx:            opOut.Summary.IdleInTxCount,
+StuckPreparedXact:   opOut.Summary.StuckPreparedXactCount,
+UnhealthyPlacements: opOut.Summary.UnhealthyPlacementCount,
+SaturatedNodes:      opOut.Summary.SaturatedNodeCount,
+BloatCandidates:     opOut.Summary.BloatCandidateCount,
+StaleAutovacuum:     opOut.Summary.StaleAutovacuumCount,
+OverallHealth:       opOut.Summary.OverallHealth,
+}
+}
+}
+
+h.OverallHealth = rollupHealth(h)
+return h
+}
+
+func hasCritical(alarms []diagnostics.Alarm) bool {
+for _, a := range alarms {
+if a.Severity == diagnostics.SeverityCritical {
+return true
+}
+}
+return false
+}
+
+func rollupHealth(h *ClusterHealthSummary) string {
+worst := "ok"
+check := func(s string) {
+switch s {
+case "critical":
+worst = "critical"
+case "warning":
+if worst != "critical" {
+worst = "warning"
+}
+case "unknown":
+if worst == "ok" {
+worst = "unknown"
+}
+}
+}
+if h.Memory != nil {
+check(h.Memory.Status)
+}
+if h.MetadataCache != nil {
+check(h.MetadataCache.Status)
+}
+if h.Connections != nil {
+check(h.Connections.Status)
+}
+if h.Drift != nil {
+check(h.Drift.Status)
+}
+if h.MetadataSync != nil {
+check(h.MetadataSync.Status)
+}
+if h.Operational != nil {
+check(h.Operational.OverallHealth)
+}
+return worst
 }

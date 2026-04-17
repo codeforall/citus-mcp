@@ -67,6 +67,7 @@ func SnapshotSourceAdvisor(ctx context.Context, deps Dependencies, input Snapsho
 	out, err := snapshotadvisor.Run(ctx, snapshotadvisor.Dependencies{
 		Pool:          deps.Pool,
 		WorkerManager: deps.WorkerManager,
+		Fanout:        deps.Fanout,
 		Cache:         deps.Cache,
 		Config:        deps.Config,
 		Capabilities:  deps.Capabilities,

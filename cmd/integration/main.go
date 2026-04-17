@@ -60,6 +60,7 @@ func main() {
 	if err != nil {
 		logger.Warn("capability detection failed", zap.Error(err))
 	}
+	fanout := db.NewFanout(pool, logger)
 
 	deps := tools.Dependencies{
 		Pool:          pool,
@@ -69,6 +70,7 @@ func main() {
 		WorkerManager: wm,
 		Capabilities:  caps,
 		Cache:         cache.New(),
+		Fanout:        fanout,
 	}
 
 	// runners

@@ -53,7 +53,7 @@ func metadataHealthTool(ctx context.Context, deps Dependencies, input MetadataHe
 		checkLevel = metadata.CheckLevelDeep
 	}
 
-	detector := metadata.NewDetector(deps.Pool, deps.WorkerManager)
+	detector := metadata.NewDetector(deps.Pool, deps.WorkerManager, deps.Fanout)
 	out, err := detector.Run(ctx, metadata.Input{
 		CheckLevel:          checkLevel,
 		IncludeFixes:        input.IncludeFixes,

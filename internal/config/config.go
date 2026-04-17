@@ -35,6 +35,7 @@ type Config struct {
 	CoordinatorDSN              string   `mapstructure:"coordinator_dsn"`
 	CoordinatorUser             string   `mapstructure:"coordinator_user"`
 	CoordinatorPassword         string   `mapstructure:"coordinator_password"`
+	CoordinatorOnly             bool     `mapstructure:"coordinator_only"`
 	WorkerDSNs                  []string `mapstructure:"worker_dsns"`
 	ConnectTimeoutSeconds       int      `mapstructure:"connect_timeout_seconds"`
 	StatementTimeoutMs          int      `mapstructure:"statement_timeout_ms"`
@@ -48,6 +49,7 @@ type Config struct {
 	CacheTTLSeconds             int      `mapstructure:"cache_ttl_seconds"`
 	LogLevel                    string   `mapstructure:"log_level"`
 	SnapshotAdvisorCollectBytes bool     `mapstructure:"snapshot_advisor_collect_bytes"`
+	SnapshotDB                  string   `mapstructure:"snapshot_db"`
 
 	// Transport configuration
 	Transport    TransportType `mapstructure:"transport"`
@@ -61,6 +63,7 @@ func defaults(v *viper.Viper) {
 	v.SetDefault("coordinator_dsn", "")
 	v.SetDefault("coordinator_user", "")
 	v.SetDefault("coordinator_password", "")
+	v.SetDefault("coordinator_only", true)
 	v.SetDefault("worker_dsns", []string{})
 	v.SetDefault("connect_timeout_seconds", 5)
 	v.SetDefault("statement_timeout_ms", 30000)
@@ -74,6 +77,7 @@ func defaults(v *viper.Viper) {
 	v.SetDefault("cache_ttl_seconds", 5)
 	v.SetDefault("log_level", "info")
 	v.SetDefault("snapshot_advisor_collect_bytes", true)
+	v.SetDefault("snapshot_db", "")
 
 	// Transport defaults
 	v.SetDefault("transport", string(TransportStdio))
@@ -98,7 +102,8 @@ func Load() (Config, error) {
 	fs.String("dsn", "", "Coordinator DSN (alias for coordinator_dsn)")
 	fs.String("coordinator_user", "", "Coordinator user (optional override)")
 	fs.String("coordinator_password", "", "Coordinator password (optional override)")
-	fs.StringSlice("worker_dsns", []string{}, "Worker DSNs (repeatable)")
+	fs.Bool("coordinator_only", true, "Connect only to coordinator (use run_command_on_workers for worker queries)")
+	fs.StringSlice("worker_dsns", []string{}, "Worker DSNs (dev/test override, repeatable)")
 	fs.Int("connect_timeout_seconds", 5, "Connection timeout in seconds")
 	fs.Int("statement_timeout_ms", 30000, "Statement timeout in milliseconds")
 	fs.String("app_name", "citus-mcp", "Application name")
@@ -110,6 +115,7 @@ func Load() (Config, error) {
 	fs.Bool("enable_caching", true, "Enable caching")
 	fs.Int("cache_ttl_seconds", 5, "Cache TTL in seconds")
 	fs.String("log_level", "info", "Log level")
+	fs.String("snapshot_db", "", "Opt-in local SQLite snapshot store path (e.g., ~/.local/state/citus-mcp/history.db). Empty = disabled.")
 	fs.Bool("snapshot_advisor_collect_bytes", true, "Collect bytes for snapshot advisor (may be heavy)")
 
 	// Transport flags
@@ -153,6 +159,10 @@ func Load() (Config, error) {
 	}
 	if err := validate(cfg); err != nil {
 		return Config{}, err
+	}
+	// Warn if coordinator_only is true but worker_dsns are provided (dev override)
+	if cfg.CoordinatorOnly && len(cfg.WorkerDSNs) > 0 {
+		fmt.Fprintf(os.Stderr, "WARNING: coordinator_only=true but worker_dsns provided; honoring worker_dsns (dev override)\n")
 	}
 	return cfg, nil
 }

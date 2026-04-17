@@ -241,6 +241,12 @@ func listNodesWithStatus(ctx context.Context, pool *pgxpool.Pool) ([]NodeStatus,
 
 // resolveDSN builds a worker DSN from explicit overrides or coordinator credentials.
 func (m *WorkerManager) resolveDSN(n NodeStatus) string {
+	// If coordinator_only is enabled and no explicit worker_dsns, return empty
+	// to prevent direct worker connections
+	if m.cfg.CoordinatorOnly && len(m.cfg.WorkerDSNs) == 0 {
+		return ""
+	}
+
 	if len(m.cfg.WorkerDSNs) > 0 {
 		// best-effort: match by index when counts align
 		// if mismatch, fallback to derive

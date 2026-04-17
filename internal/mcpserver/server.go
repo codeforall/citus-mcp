@@ -12,10 +12,12 @@ import (
 	"citus-mcp/internal/cache"
 	"citus-mcp/internal/config"
 	"citus-mcp/internal/db"
+	"citus-mcp/internal/diagnostics"
 	"citus-mcp/internal/mcpserver/prompts"
 	"citus-mcp/internal/mcpserver/resources"
 	"citus-mcp/internal/mcpserver/tools"
 	"citus-mcp/internal/safety"
+	"citus-mcp/internal/snapshot"
 	"citus-mcp/internal/version"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -51,9 +53,22 @@ func New(cfg config.Config, logger *zap.Logger) (*Server, error) {
 		cacheTTL = 5 * time.Second
 	}
 	cacheInstance := cache.New()
+	alarmSink := diagnostics.NewSink(0)
+
+	var snapStore *snapshot.Store
+	if cfg.SnapshotDB != "" {
+		s, err := snapshot.Open(cfg.SnapshotDB)
+		if err != nil {
+			logger.Warn("snapshot store disabled (open failed)", zap.Error(err), zap.String("path", cfg.SnapshotDB))
+		} else {
+			snapStore = s
+			logger.Info("snapshot store enabled", zap.String("path", s.Path()))
+		}
+	}
 
 	impl := &mcp.Implementation{Name: serverName, Version: version.Version}
 	m := mcp.NewServer(impl, nil)
+	fanout := db.NewFanout(pool, logger)
 	deps := tools.Dependencies{
 		Pool:          pool,
 		Logger:        logger,
@@ -62,10 +77,14 @@ func New(cfg config.Config, logger *zap.Logger) (*Server, error) {
 		WorkerManager: wm,
 		Capabilities:  caps,
 		Cache:         cacheInstance,
+		Alarms:        alarmSink,
+		Snapshot:      snapStore,
+		Fanout:        fanout,
 	}
 	tools.RegisterAll(m, deps)
 	resources.RegisterAll(m, deps)
 	prompts.RegisterAll(m, deps)
+	prompts.RegisterRunbooks(m, deps)
 
 	return &Server{cfg: cfg, logger: logger, pool: pool, guardrails: guard, deps: deps, srv: m}, nil
 }

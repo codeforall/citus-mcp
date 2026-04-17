@@ -18,14 +18,16 @@ import (
 type CrossNodeChecker struct {
 	coordinatorPool *pgxpool.Pool
 	workerManager   *db.WorkerManager
+	fanout          *db.Fanout
 	includeFixes    bool
 }
 
 // NewCrossNodeChecker creates a new cross-node checker.
-func NewCrossNodeChecker(coordinatorPool *pgxpool.Pool, workerManager *db.WorkerManager, includeFixes bool) *CrossNodeChecker {
+func NewCrossNodeChecker(coordinatorPool *pgxpool.Pool, workerManager *db.WorkerManager, fanout *db.Fanout, includeFixes bool) *CrossNodeChecker {
 	return &CrossNodeChecker{
 		coordinatorPool: coordinatorPool,
 		workerManager:   workerManager,
+		fanout:          fanout,
 		includeFixes:    includeFixes,
 	}
 }
@@ -35,35 +37,49 @@ func (c *CrossNodeChecker) CheckShardExistence(ctx context.Context) CheckResult 
 	return runCheck(ctx, "cross_node_shard_existence", "Cross-Node Shard Existence", CategoryCrossNode,
 		"Validates that shard tables exist on workers as recorded in coordinator metadata",
 		func() ([]Issue, error) {
-			if c.workerManager == nil {
-				return nil, nil // No worker connections configured
+			if c.fanout == nil {
+				return nil, nil // No fanout configured
 			}
 
-			// Get worker pools
-			pools, workerInfos, err := c.workerManager.Pools(ctx)
+			// Get expected shards per worker from coordinator
+			infos, err := c.workerManager.Topology(ctx)
 			if err != nil {
-				return nil, fmt.Errorf("get worker pools: %w", err)
+				return nil, fmt.Errorf("get worker topology: %w", err)
 			}
 
-			if len(pools) == 0 {
-				return nil, nil // No worker pools available
+			// Map nodename:port -> WorkerInfo
+			nodeMap := make(map[string]db.WorkerInfo)
+			for _, info := range infos {
+				key := fmt.Sprintf("%s:%d", info.NodeName, info.NodePort)
+				nodeMap[key] = info
+			}
+
+			// Get actual shard tables on workers via Fanout
+			results, err := c.fanout.OnWorkers(ctx, QueryWorkerShardTables)
+			if err != nil {
+				return nil, fmt.Errorf("fanout worker shard tables: %w", err)
 			}
 
 			var allIssues []CrossNodeShardIssue
 
-			for _, workerInfo := range workerInfos {
-				pool, ok := pools[workerInfo.NodeID]
-				if !ok {
-					continue // Pool not available for this worker
+			for _, res := range results {
+				if !res.Success {
+					continue // Skip unreachable workers
 				}
 
-				// Get expected shards on this worker
-				expectedRows, err := c.coordinatorPool.Query(ctx, QueryExpectedShardPlacements, workerInfo.NodeName, workerInfo.NodePort)
+				key := fmt.Sprintf("%s:%d", res.NodeName, res.NodePort)
+				workerInfo, ok := nodeMap[key]
+				if !ok {
+					continue
+				}
+
+				// Get expected shards on this worker from coordinator
+				expectedRows, err := c.coordinatorPool.Query(ctx, QueryExpectedShardPlacements, res.NodeName, res.NodePort)
 				if err != nil {
 					continue
 				}
 
-				expectedShards := make(map[string]int64) // shard_name -> shard_id
+				expectedShards := make(map[string]int64) // schema.shard_name -> shard_id
 				for expectedRows.Next() {
 					var shardID int64
 					var tableName, schemaName, shardName string
@@ -75,22 +91,18 @@ func (c *CrossNodeChecker) CheckShardExistence(ctx context.Context) CheckResult 
 				}
 				expectedRows.Close()
 
-				// Get actual shard tables on worker
-				actualRows, err := pool.Query(ctx, QueryWorkerShardTables)
-				if err != nil {
-					continue
-				}
-
+				// Build actualShards from Fanout results
 				actualShards := make(map[string]bool)
-				for actualRows.Next() {
+				for _, row := range res.Rows {
 					var schemaName, tableName string
-					if err := actualRows.Scan(&schemaName, &tableName); err != nil {
-						actualRows.Close()
-						continue
+					if s, ok := row["schema_name"].(string); ok {
+						schemaName = s
+					}
+					if t, ok := row["table_name"].(string); ok {
+						tableName = t
 					}
 					actualShards[schemaName+"."+tableName] = true
 				}
-				actualRows.Close()
 
 				// Find mismatches - expected but not on worker
 				for shardName, shardID := range expectedShards {
@@ -109,8 +121,6 @@ func (c *CrossNodeChecker) CheckShardExistence(ctx context.Context) CheckResult 
 				// Find orphans on worker - on worker but not expected
 				for shardName := range actualShards {
 					if _, expected := expectedShards[shardName]; !expected {
-						// This could be a legitimate orphan or just a different table
-						// Only report if it looks like a shard (ends with _digits)
 						allIssues = append(allIssues, CrossNodeShardIssue{
 							ShardID:       0, // Unknown
 							ShardName:     shardName,
@@ -259,34 +269,48 @@ func (c *CrossNodeChecker) CheckExtensionVersions(ctx context.Context) CheckResu
 			}
 
 			// Get worker pools
-			pools, workerInfos, err := c.workerManager.Pools(ctx)
+			if c.fanout == nil {
+				return nil, nil // No fanout configured
+			}
+
+			// Query worker extensions via Fanout
+			results, err := c.fanout.OnWorkers(ctx, QueryNodeExtensions)
 			if err != nil {
-				return nil, fmt.Errorf("get worker pools: %w", err)
+				return nil, fmt.Errorf("fanout worker extensions: %w", err)
+			}
+
+			// Map nodename:port -> WorkerInfo
+			infos, _ := c.workerManager.Topology(ctx)
+			nodeMap := make(map[string]db.WorkerInfo)
+			for _, info := range infos {
+				key := fmt.Sprintf("%s:%d", info.NodeName, info.NodePort)
+				nodeMap[key] = info
 			}
 
 			var mismatches []ExtensionMismatch
 
-			for _, workerInfo := range workerInfos {
-				pool, ok := pools[workerInfo.NodeID]
+			for _, res := range results {
+				if !res.Success {
+					continue
+				}
+
+				key := fmt.Sprintf("%s:%d", res.NodeName, res.NodePort)
+				workerInfo, ok := nodeMap[key]
 				if !ok {
 					continue
 				}
 
-				workerExtRows, err := pool.Query(ctx, QueryNodeExtensions)
-				if err != nil {
-					continue
-				}
-
 				workerExtensions := make(map[string]string)
-				for workerExtRows.Next() {
+				for _, row := range res.Rows {
 					var name, version string
-					if err := workerExtRows.Scan(&name, &version); err != nil {
-						workerExtRows.Close()
-						continue
+					if n, ok := row["extname"].(string); ok {
+						name = n
+					}
+					if v, ok := row["extversion"].(string); ok {
+						version = v
 					}
 					workerExtensions[name] = version
 				}
-				workerExtRows.Close()
 
 				// Compare versions
 				for extName, coordVersion := range coordExtensions {
@@ -421,10 +445,8 @@ func (c *CrossNodeChecker) CheckMetadataSync(ctx context.Context) CheckResult {
 				return nil, nil // No metadata workers
 			}
 
-			// Get worker pools
-			pools, _, err := c.workerManager.Pools(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("get worker pools: %w", err)
+			if c.fanout == nil {
+				return nil, nil // No fanout configured
 			}
 
 			// Get coordinator metadata counts
@@ -442,34 +464,52 @@ func (c *CrossNodeChecker) CheckMetadataSync(ctx context.Context) CheckResult {
 				return nil, err
 			}
 
+			// Combined SQL for worker metadata counts
+			metadataCountSQL := `
+SELECT
+  (SELECT COUNT(*) FROM pg_dist_partition) AS partition_count,
+  (SELECT COUNT(*) FROM pg_dist_shard) AS shard_count,
+  (SELECT COUNT(*) FROM pg_dist_placement) AS placement_count,
+  (SELECT COUNT(*) FROM pg_dist_node WHERE isactive = true) AS node_count
+`
+
+			// Query workers via Fanout
+			results, err := c.fanout.OnWorkers(ctx, metadataCountSQL)
+			if err != nil {
+				return nil, fmt.Errorf("fanout metadata counts: %w", err)
+			}
+
+			// Build node map
+			nodeMap := make(map[string]int32)
+			for _, w := range metadataWorkers {
+				key := fmt.Sprintf("%s:%d", w.name, w.port)
+				nodeMap[key] = w.nodeID
+			}
+
 			var issues []Issue
 			var driftNodes []string
 
-			for _, worker := range metadataWorkers {
-				pool, ok := pools[worker.nodeID]
+			for _, res := range results {
+				key := fmt.Sprintf("%s:%d", res.NodeName, res.NodePort)
+				_, ok := nodeMap[key]
 				if !ok {
+					continue // Not a metadata worker
+				}
+
+				if !res.Success || len(res.Rows) == 0 {
 					continue
 				}
 
-				var workerPartitionCount, workerShardCount, workerPlacementCount, workerNodeCount int64
-				if err := pool.QueryRow(ctx, QueryDistTableCount).Scan(&workerPartitionCount); err != nil {
-					continue
-				}
-				if err := pool.QueryRow(ctx, QueryShardCount).Scan(&workerShardCount); err != nil {
-					continue
-				}
-				if err := pool.QueryRow(ctx, QueryPlacementCount).Scan(&workerPlacementCount); err != nil {
-					continue
-				}
-				if err := pool.QueryRow(ctx, QueryNodeCount).Scan(&workerNodeCount); err != nil {
-					continue
-				}
+				workerPartitionCount, _ := res.Int("partition_count")
+				workerShardCount, _ := res.Int("shard_count")
+				workerPlacementCount, _ := res.Int("placement_count")
+				workerNodeCount, _ := res.Int("node_count")
 
 				if workerPartitionCount != coordPartitionCount ||
 					workerShardCount != coordShardCount ||
 					workerPlacementCount != coordPlacementCount ||
 					workerNodeCount != coordNodeCount {
-					driftNodes = append(driftNodes, fmt.Sprintf("%s:%d", worker.name, worker.port))
+					driftNodes = append(driftNodes, key)
 				}
 			}
 

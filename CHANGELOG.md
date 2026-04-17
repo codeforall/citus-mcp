@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING**: Default connection mode is now coordinator-only. Worker data is fetched via `run_command_on_workers()` UDF instead of direct connections. This matches production Citus deployments where only the coordinator is exposed.
+- Added `coordinator_only` config flag (default: `true`) to control connection behavior.
+- `worker_dsns` is now a dev/test override only. When `coordinator_only=true` and `worker_dsns` is provided, a warning is logged but the override is honored.
+- Refactored `citus_mx_readiness`, `citus_extension_drift_scanner`, and `citus_worker_memcontexts` tools to use coordinator-based fanout.
+- Memory context probing on workers now runs on fresh backends via `run_command_on_workers`, which changes semantics: measurements reflect a fresh connection rather than cached state.
+
 ### Added
+- New `internal/db/fanout.go` package for coordinator-based worker queries via `run_command_on_workers()`.
+- Helper functions `db.QuoteLiteral()` and `db.QuoteIdent()` for safe SQL literal/identifier quoting.
 - Initial release of citus-mcp
 - MCP server with stdio, SSE, and streamable HTTP transports
 - **Cluster Inspection Tools**

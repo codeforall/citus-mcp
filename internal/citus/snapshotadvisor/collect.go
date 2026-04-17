@@ -8,10 +8,7 @@ package snapshotadvisor
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 )
 
 func collectWorkers(ctx context.Context, deps Dependencies, in Input) ([]WorkerMetrics, []Warning, error) {
@@ -29,43 +26,35 @@ func collectWorkers(ctx context.Context, deps Dependencies, in Input) ([]WorkerM
 		return nil, []Warning{{Code: "PERMISSION", Message: fmt.Sprintf("failed to fetch shard counts: %v", err)}}, nil
 	}
 
-	pools, _, _ := deps.WorkerManager.Pools(ctx)
-	reachable := make(map[int32]bool, len(pools))
+	reachable := make(map[int32]bool, len(infos))
 	unreachableWarnings := []Warning{}
-	var reachMu sync.Mutex
 
-	// Ping workers concurrently (limit 4)
-	eg, ctxPing := errgroup.WithContext(ctx)
-	sem := make(chan struct{}, 4)
-	for _, info := range infos {
-		info := info
-		key := fmt.Sprintf("%s:%d", info.NodeName, info.NodePort)
-		if _, skip := exclude[key]; skip {
-			continue
-		}
-		pool := pools[info.NodeID]
-		if pool == nil {
-			reachable[info.NodeID] = false
-			continue
-		}
-		sem <- struct{}{}
-		eg.Go(func() error {
-			defer func() { <-sem }()
-			var one int
-			if err := pool.QueryRow(ctxPing, "SELECT 1").Scan(&one); err != nil {
-				reachMu.Lock()
-				reachable[info.NodeID] = false
-				unreachableWarnings = append(unreachableWarnings, Warning{Code: "PARTIAL_RESULTS", Message: fmt.Sprintf("worker %s:%d unreachable: %v", info.NodeName, info.NodePort, err)})
-				reachMu.Unlock()
-			} else {
-				reachMu.Lock()
-				reachable[info.NodeID] = true
-				reachMu.Unlock()
+	// Ping workers via Fanout
+	if deps.Fanout != nil {
+		results, err := deps.Fanout.OnWorkers(ctx, "SELECT 1 AS one")
+		if err == nil {
+			// Build map nodename:port -> nodeID
+			nodeMap := make(map[string]int32)
+			for _, info := range infos {
+				key := fmt.Sprintf("%s:%d", info.NodeName, info.NodePort)
+				nodeMap[key] = info.NodeID
 			}
-			return nil
-		})
+			for _, res := range results {
+				key := fmt.Sprintf("%s:%d", res.NodeName, res.NodePort)
+				if nodeID, ok := nodeMap[key]; ok {
+					if res.Success {
+						reachable[nodeID] = true
+					} else {
+						reachable[nodeID] = false
+						unreachableWarnings = append(unreachableWarnings, Warning{
+							Code:    "PARTIAL_RESULTS",
+							Message: fmt.Sprintf("worker %s:%d unreachable: %v", res.NodeName, res.NodePort, res.Error),
+						})
+					}
+				}
+			}
+		}
 	}
-	_ = eg.Wait()
 
 	// Collect bytes (best-effort)
 	bytesMap, bytesWarnings := fetchBytes(ctx, deps)
@@ -180,37 +169,48 @@ func fetchBytesFromShardSizes(ctx context.Context, deps Dependencies) (map[int32
 }
 
 func fetchBytesFromWorkers(ctx context.Context, deps Dependencies) (map[int32]int64, []Warning) {
-	pools, infos, _ := deps.WorkerManager.Pools(ctx)
 	out := make(map[int32]int64)
 	warnings := []Warning{}
-	var mu sync.Mutex
-	eg, ctxq := errgroup.WithContext(ctx)
-	sem := make(chan struct{}, 4)
+
+	if deps.Fanout == nil {
+		warnings = append(warnings, Warning{Code: "PARTIAL_RESULTS", Message: "bytes not available; falling back to shard counts"})
+		return out, warnings
+	}
+
+	sql := `SELECT sum(pg_total_relation_size(c.oid))::bigint AS total_bytes
+FROM pg_class c 
+JOIN pg_namespace n ON n.oid=c.relnamespace 
+WHERE n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') AND c.relkind='r'`
+
+	results, err := deps.Fanout.OnWorkers(ctx, sql)
+	if err != nil {
+		warnings = append(warnings, Warning{Code: "PARTIAL_RESULTS", Message: fmt.Sprintf("fetchBytesFromWorkers fanout: %v", err)})
+		return out, warnings
+	}
+
+	// Build nodename:port -> nodeID map
+	infos, _ := deps.WorkerManager.Topology(ctx)
+	nodeMap := make(map[string]int32)
 	for _, info := range infos {
-		info := info
-		pool := pools[info.NodeID]
-		if pool == nil {
+		key := fmt.Sprintf("%s:%d", info.NodeName, info.NodePort)
+		nodeMap[key] = info.NodeID
+	}
+
+	for _, res := range results {
+		key := fmt.Sprintf("%s:%d", res.NodeName, res.NodePort)
+		nodeID, ok := nodeMap[key]
+		if !ok {
 			continue
 		}
-		sem <- struct{}{}
-		eg.Go(func() error {
-			defer func() { <-sem }()
-			var total *int64
-			if err := pool.QueryRow(ctxq, "SELECT sum(pg_total_relation_size(c.oid))::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') AND c.relkind='r'").Scan(&total); err != nil {
-				mu.Lock()
-				warnings = append(warnings, Warning{Code: "PARTIAL_RESULTS", Message: fmt.Sprintf("bytes fetch failed for %s:%d: %v", info.NodeName, info.NodePort, err)})
-				mu.Unlock()
-				return nil
-			}
-			if total != nil {
-				mu.Lock()
-				out[info.NodeID] = *total
-				mu.Unlock()
-			}
-			return nil
-		})
+		if !res.Success {
+			warnings = append(warnings, Warning{Code: "PARTIAL_RESULTS", Message: fmt.Sprintf("bytes fetch failed for %s: %v", key, res.Error)})
+			continue
+		}
+		if total, ok := res.Int("total_bytes"); ok {
+			out[nodeID] = total
+		}
 	}
-	_ = eg.Wait()
+
 	if len(out) == 0 {
 		warnings = append(warnings, Warning{Code: "PARTIAL_RESULTS", Message: "bytes not available; falling back to shard counts"})
 	}

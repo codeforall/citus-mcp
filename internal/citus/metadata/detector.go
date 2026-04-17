@@ -17,13 +17,15 @@ import (
 type Detector struct {
 	pool          *pgxpool.Pool
 	workerManager *db.WorkerManager
+	fanout        *db.Fanout
 }
 
 // NewDetector creates a new metadata health detector.
-func NewDetector(pool *pgxpool.Pool, workerManager *db.WorkerManager) *Detector {
+func NewDetector(pool *pgxpool.Pool, workerManager *db.WorkerManager, fanout *db.Fanout) *Detector {
 	return &Detector{
 		pool:          pool,
 		workerManager: workerManager,
+		fanout:        fanout,
 	}
 }
 
@@ -106,7 +108,7 @@ func (d *Detector) runCrossNodeChecks(ctx context.Context, input Input) []CheckR
 		return results
 	}
 
-	checker := NewCrossNodeChecker(d.pool, d.workerManager, input.IncludeFixes)
+	checker := NewCrossNodeChecker(d.pool, d.workerManager, d.fanout, input.IncludeFixes)
 
 	results = append(results, checker.CheckExtensionVersions(ctx))
 	results = append(results, checker.CheckShardExistence(ctx))
@@ -148,7 +150,7 @@ func (d *Detector) calculateSummary(checks []Check, issues []Issue) Summary {
 
 // QuickHealthCheck performs a fast health check returning just healthy/unhealthy.
 func QuickHealthCheck(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
-	detector := NewDetector(pool, nil)
+	detector := NewDetector(pool, nil, nil)
 	output, err := detector.Run(ctx, Input{CheckLevel: CheckLevelBasic})
 	if err != nil {
 		return false, err
