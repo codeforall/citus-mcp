@@ -422,6 +422,13 @@ func RegisterAll(server *mcp.Server, deps Dependencies) {
 		return MxReadinessTool(ctx, deps, input)
 	})
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "citus_2pc_recovery_inspector",
+		Description: "Read-only 2PC recovery forensics. Fans out pg_prepared_xacts to the coordinator and every active worker, parses Citus prepared-transaction GIDs (citus_<group>_<pid>_<txn>_<conn>), correlates with pg_dist_transaction and get_all_active_transactions(), and classifies each prepared xact as commit_needed / rollback_needed / in_flight / non_citus (mirrors RecoverWorkerTransactions in src/backend/distributed/transaction/transaction_recovery.c). Emits a ready-to-run per-node COMMIT PREPARED / ROLLBACK PREPARED recovery script plus alarms for commit backlog, orphan xacts (critical if > stuck_orphan_seconds), and slow-in-flight 2PCs. Never executes COMMIT/ROLLBACK itself.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input TwoPCRecoveryInput) (*mcp.CallToolResult, TwoPCRecoveryOutput, error) {
+		return TwoPCRecoveryInspectorTool(ctx, deps, input)
+	})
+
 	// ---- M6: covering report ----
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "citus_full_report",

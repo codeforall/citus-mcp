@@ -126,6 +126,7 @@ type FullReportWorkloadSection struct {
 	QueryPathology *QueryPathologyOutput `json:"query_pathology,omitempty"`
 	RoutingDrift   *RoutingDriftOutput   `json:"routing_drift,omitempty"`
 	SyntheticProbe *SyntheticProbeOutput `json:"synthetic_probe,omitempty"`
+	TwoPCRecovery  *TwoPCRecoveryOutput  `json:"two_pc_recovery,omitempty"`
 }
 
 type FullReportShardsSection struct {
@@ -404,6 +405,14 @@ func FullReportTool(ctx context.Context, deps Dependencies, in FullReportInput) 
 		wl.RoutingDrift = &o
 		return nil
 	})
+	run("two_pc_recovery_inspector", func() error {
+		_, o, err := TwoPCRecoveryInspectorTool(ctx, deps, TwoPCRecoveryInput{SuppressRecoveryScript: !in.IncludeVerboseOutputs})
+		if err != nil {
+			return err
+		}
+		wl.TwoPCRecovery = &o
+		return nil
+	})
 	if in.IncludeSyntheticProbe {
 		run("synthetic_probe", func() error {
 			_, o, err := SyntheticProbeTool(ctx, deps, SyntheticProbeInput{})
@@ -417,7 +426,8 @@ func FullReportTool(ctx context.Context, deps Dependencies, in FullReportInput) 
 		out.ToolsSkipped = append(out.ToolsSkipped, "synthetic_probe (opt-in)")
 	}
 	if wl.Activity != nil || wl.Locks != nil || wl.Jobs != nil || wl.TenantRisk != nil ||
-		wl.QueryPathology != nil || wl.RoutingDrift != nil || wl.SyntheticProbe != nil {
+		wl.QueryPathology != nil || wl.RoutingDrift != nil || wl.SyntheticProbe != nil ||
+		wl.TwoPCRecovery != nil {
 		out.Workload = wl
 	}
 
@@ -708,6 +718,17 @@ func buildTopRecommendations(r *FullReportOutput) []string {
 		}
 		for _, s := range r.Capacity.MetadataSyncRisk.Recommendations {
 			push(s)
+		}
+	}
+	// 2PC recovery — surface commit/rollback backlog prominently (operators
+	// often miss prepared-xact accumulation until replication lag or WAL
+	// retention alerts fire).
+	if r.Workload != nil && r.Workload.TwoPCRecovery != nil {
+		t := r.Workload.TwoPCRecovery
+		if t.Summary.CommitNeeded+t.Summary.RollbackNeeded > 0 {
+			push(fmt.Sprintf(
+				"2PC recovery needed: %d commit_needed + %d rollback_needed prepared xact(s) (oldest %.0fs). Run SELECT recover_prepared_transactions(); on the coordinator, or consult two_pc_recovery.recovery_script for per-node manual recovery.",
+				t.Summary.CommitNeeded, t.Summary.RollbackNeeded, t.Summary.OldestAgeSeconds))
 		}
 	}
 	if r.Alarms != nil {

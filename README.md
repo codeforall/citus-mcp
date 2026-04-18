@@ -114,8 +114,8 @@ You should see a "pong" response confirming the connection works.
 
 ## ✨ Features
 
-68 MCP tools spanning diagnostics, capacity planning, advisors, alarms,
-time-series, and gated execute operations. The single covering tool
+69 MCP tools spanning diagnostics, forensics, capacity planning, advisors,
+alarms, time-series, and gated execute operations. The single covering tool
 `citus_full_report` runs ~30 read-only diagnostics in one shot and rolls
 up overall health, top findings, and concrete recommendations.
 
@@ -175,6 +175,12 @@ up overall health, top findings, and concrete recommendations.
 | `citus_metadata_sync_risk` | Estimates `citus_activate_node` work + timeout/OOM/lock risks; emits concrete `recommended_max_locks_per_transaction` and exact `ALTER SYSTEM SET …` |
 | `citus_mx_readiness` | Mesh-connection budgeting before enabling MX |
 | `citus_snapshot_source_advisor` | Picks best source worker for snapshot-based add |
+
+### 🚑 Forensics & Recovery
+
+| Tool | Description |
+|------|-------------|
+| `citus_2pc_recovery_inspector` | Fans out `pg_prepared_xacts` to coord + workers, parses Citus GIDs, correlates with `pg_dist_transaction` and `get_all_active_transactions()`, and classifies each as `commit_needed` / `rollback_needed` / `in_flight`. Emits a ready-to-run per-node `COMMIT PREPARED` / `ROLLBACK PREPARED` script + alarms for commit backlog and orphan xacts. Read-only — never issues COMMIT/ROLLBACK itself. |
 
 ### 🔧 Metadata, Extensions & Routing
 
@@ -921,6 +927,25 @@ takes no input.
 | `citus_metadata_sync_risk` | `target_max_locks_per_transaction?`, `target_node_ram_gib?`, `assume_sync_mode?` | Estimates `citus_activate_node` work and timeout/OOM/lock risks. Returns `recommended_max_locks_per_transaction` (concrete multiple-of-64 value) when current setting would exhaust the shared lock table, plus the exact `ALTER SYSTEM SET …` statement in `recommendations[]`. |
 | `citus_mx_readiness` | `expected_clients_per_node?`, `target_node_ram_gib?`, `new_node_max_connections?`, `concurrent_queries_per_peer?` | Mesh-connection budgeting before MX |
 | `citus_snapshot_source_advisor` | `strategy?`, `max_candidates?`, `include_simulation?` | Picks best source worker for snapshot-based add |
+
+### Forensics & Recovery
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `citus_2pc_recovery_inspector` | `in_flight_threshold_seconds?` (default 60), `stuck_orphan_seconds?` (default 600), `include_non_citus?`, `suppress_recovery_script?` | Forensics for stuck 2PC / prepared-transaction state. Fans out `pg_prepared_xacts` across coord + workers, parses Citus GIDs (`citus_<group>_<pid>_<txn>_<conn>`), correlates with `pg_dist_transaction` and `get_all_active_transactions()`, classifies each as `commit_needed` / `rollback_needed` / `in_flight` / `non_citus`, and emits a ready-to-run per-node recovery script. Emits `two_pc.commit_backlog`, `two_pc.orphans` (critical if older than `stuck_orphan_seconds`), `two_pc.slow_in_flight` alarms. Read-only — never issues COMMIT/ROLLBACK itself. |
+
+**Example — `citus_2pc_recovery_inspector`:**
+
+```jsonc
+// Default — detect commit_needed / rollback_needed / in_flight
+{}
+
+// Aggressive: treat anything >10s as orphan, escalate orphans older than 2 min
+{"in_flight_threshold_seconds": 10, "stuck_orphan_seconds": 120}
+
+// Compact output (no recovery script)
+{"suppress_recovery_script": true}
+```
 
 ### Metadata / Extensions / Routing
 
