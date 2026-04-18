@@ -18,6 +18,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -64,12 +65,43 @@ type FullReportInput struct {
 	IncludeVerboseOutputs bool `json:"include_verbose_outputs,omitempty"`
 }
 
-// FullReportOutput is the comprehensive report.
+// SkipReason is the structured "this tool produced no actionable output
+// on this cluster" contract. Every reason is one of a small set of
+// well-known codes so downstream consumers can distinguish
+// "user_requested" (the operator passed skip_sections) from
+// "missing_dependency" (e.g. pg_stat_statements not installed) from
+// "not_citus" (coordinator has no citus extension loaded). The
+// FullReport aggregator treats tools_skipped as the single source of
+// truth: a section that returns a skipReason appears here and is NOT
+// added to tools_run.
+type SkipReason struct {
+	Tool   string `json:"tool"`
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// skipError lets a section signal "I ran but produced no actionable
+// output, for this well-known reason". The aggregator unwraps this via
+// errors.As and records it in ToolsSkipped. Section functions that
+// can legitimately produce no output (e.g. pg_stat_statements-dependent
+// tools on clusters without that extension) return skipSection(...).
+type skipError struct {
+	Reason string
+	Detail string
+}
+
+func (e *skipError) Error() string { return e.Reason }
+
+// skipSection is the helper a tool returns when it would otherwise
+// produce an empty output. See SkipReason.
+func skipSection(reason, detail string) error {
+	return &skipError{Reason: reason, Detail: detail}
+}
 type FullReportOutput struct {
 	GeneratedAt   string            `json:"generated_at"`
 	DurationMs    int64             `json:"duration_ms"`
 	ToolsRun      []string          `json:"tools_run"`
-	ToolsSkipped  []string          `json:"tools_skipped,omitempty"`
+	ToolsSkipped  []SkipReason      `json:"tools_skipped,omitempty"`
 	SectionErrors map[string]string `json:"section_errors,omitempty"`
 
 	// High-level rollup
@@ -150,7 +182,7 @@ func FullReportTool(ctx context.Context, deps Dependencies, in FullReportInput) 
 	out := FullReportOutput{
 		GeneratedAt:        start.UTC().Format(time.RFC3339),
 		ToolsRun:           []string{},
-		ToolsSkipped:       []string{},
+		ToolsSkipped:       []SkipReason{},
 		SectionErrors:      map[string]string{},
 		SectionDurationsMs: map[string]int64{},
 		TopFindings:        []string{},
@@ -162,17 +194,29 @@ func FullReportTool(ctx context.Context, deps Dependencies, in FullReportInput) 
 	}
 
 	// run wraps a section call with timing, error capture, and skip-list honor.
+	// Skip contract:
+	//   * user pre-selected via SkipSections  -> ToolsSkipped[user_requested]
+	//   * section returned skipError          -> ToolsSkipped[<reason>]
+	//   * section returned real error         -> SectionErrors + ToolsRun
+	//   * section returned nil                -> ToolsRun
+	// tools_skipped is the SINGLE source of truth for "no output".
 	run := func(name string, fn func() error) {
 		if skip[name] {
-			out.ToolsSkipped = append(out.ToolsSkipped, name)
+			out.ToolsSkipped = append(out.ToolsSkipped, SkipReason{Tool: name, Reason: "user_requested"})
 			return
 		}
 		t0 := time.Now()
-		if err := fn(); err != nil {
+		err := fn()
+		out.SectionDurationsMs[name] = time.Since(t0).Milliseconds()
+		var se *skipError
+		if errors.As(err, &se) {
+			out.ToolsSkipped = append(out.ToolsSkipped, SkipReason{Tool: name, Reason: se.Reason, Detail: se.Detail})
+			return
+		}
+		if err != nil {
 			out.SectionErrors[name] = err.Error()
 		}
 		out.ToolsRun = append(out.ToolsRun, name)
-		out.SectionDurationsMs[name] = time.Since(t0).Milliseconds()
 	}
 
 	// --- Summary ---------------------------------------------------------
@@ -180,6 +224,12 @@ func FullReportTool(ctx context.Context, deps Dependencies, in FullReportInput) 
 		_, o, err := clusterSummaryTool(ctx, deps, ClusterSummaryInput{All: true})
 		if err != nil {
 			return err
+		}
+		// The tool can return an empty output when the coordinator has
+		// no citus extension loaded (callError path). Surface that as a
+		// structured skip so tools_skipped stays authoritative.
+		if o.Coordinator.Host == "" && o.Coordinator.CitusVersion == "" {
+			return skipSection("citus_extension_not_installed", "CREATE EXTENSION citus on coordinator")
 		}
 		out.Summary = &o
 		return nil
@@ -350,7 +400,7 @@ func FullReportTool(ctx context.Context, deps Dependencies, in FullReportInput) 
 			return nil
 		})
 	} else {
-		out.ToolsSkipped = append(out.ToolsSkipped, "pgbouncer_inspector (no admin dsn)")
+		out.ToolsSkipped = append(out.ToolsSkipped, SkipReason{Tool: "pgbouncer_inspector", Reason: "no_admin_dsn", Detail: "pass pgbouncer_admin_dsn input to enable"})
 	}
 	if cap.ConnectionCapacity != nil || cap.ConnectionFanoutSim != nil || cap.MXReadiness != nil ||
 		cap.MetadataSyncRisk != nil || cap.PoolerAdvisor != nil || cap.PgBouncerInspector != nil {
@@ -425,7 +475,7 @@ func FullReportTool(ctx context.Context, deps Dependencies, in FullReportInput) 
 			return nil
 		})
 	} else {
-		out.ToolsSkipped = append(out.ToolsSkipped, "synthetic_probe (opt-in)")
+		out.ToolsSkipped = append(out.ToolsSkipped, SkipReason{Tool: "synthetic_probe", Reason: "opt_in", Detail: "set run_synthetic_probe=true to enable"})
 	}
 	if wl.Activity != nil || wl.Locks != nil || wl.Jobs != nil || wl.TenantRisk != nil ||
 		wl.QueryPathology != nil || wl.RoutingDrift != nil || wl.SyntheticProbe != nil ||
@@ -535,7 +585,7 @@ func FullReportTool(ctx context.Context, deps Dependencies, in FullReportInput) 
 			return nil
 		})
 	} else {
-		out.ToolsSkipped = append(out.ToolsSkipped, "hardware_sizer (needs target inputs)")
+		out.ToolsSkipped = append(out.ToolsSkipped, SkipReason{Tool: "hardware_sizer", Reason: "needs_target_inputs", Detail: "target_data_size_bytes, target_concurrent_clients, workload_mode, and deployment_mode required"})
 	}
 
 	// --- Aggregate alarms (last; gives every tool a chance to emit) -----

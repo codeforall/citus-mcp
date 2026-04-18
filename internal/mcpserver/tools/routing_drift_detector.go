@@ -56,7 +56,7 @@ func RoutingDriftDetectorTool(ctx context.Context, deps Dependencies, in Routing
 	if err := deps.Pool.QueryRow(ctx,
 		"SELECT to_regclass('pg_catalog.pg_stat_statements') IS NOT NULL OR to_regclass('public.pg_stat_statements') IS NOT NULL").Scan(&ok); err != nil || !ok {
 		out.Warnings = append(out.Warnings, "pg_stat_statements not installed")
-		return nil, out, nil
+		return nil, out, skipSection("pg_stat_statements_not_installed", "install pg_stat_statements on coordinator and add to shared_preload_libraries")
 	}
 	rows, err := deps.Pool.Query(ctx, `
 SELECT COALESCE(queryid,0)::bigint, LEFT(query,1000), calls, mean_exec_time,
@@ -96,6 +96,9 @@ LIMIT $2`, in.MinCalls, in.TopN)
 			r.Finding = "ok"
 		}
 		out.Rows = append(out.Rows, r)
+	}
+	if len(out.Rows) == 0 {
+		return nil, out, skipSection("no_statements_tracked", fmt.Sprintf("pg_stat_statements installed but no queries met min_calls=%d threshold", in.MinCalls))
 	}
 	return nil, out, nil
 }

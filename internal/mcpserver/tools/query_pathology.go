@@ -55,7 +55,7 @@ func QueryPathologyTool(ctx context.Context, deps Dependencies, in QueryPatholog
 	if err := deps.Pool.QueryRow(ctx,
 		"SELECT to_regclass('public.pg_stat_statements') IS NOT NULL OR to_regclass('pg_catalog.pg_stat_statements') IS NOT NULL").Scan(&ok); err != nil || !ok {
 		out.Warnings = append(out.Warnings, "pg_stat_statements extension not installed")
-		return nil, out, nil
+		return nil, out, skipSection("pg_stat_statements_not_installed", "install pg_stat_statements on coordinator and add to shared_preload_libraries")
 	}
 
 	rows, err := deps.Pool.Query(ctx, `
@@ -97,6 +97,9 @@ LIMIT $2`, in.MinCalls, in.TopN)
 			}
 		}
 		out.Rows = append(out.Rows, r)
+	}
+	if len(out.Rows) == 0 {
+		return nil, out, skipSection("no_statements_tracked", fmt.Sprintf("pg_stat_statements installed but no queries met min_calls=%d threshold; raise pg_stat_statements.max, wait for workload, or lower min_calls input", in.MinCalls))
 	}
 	return nil, out, nil
 }

@@ -164,7 +164,7 @@ func ProactiveHealthTool(ctx context.Context, deps Dependencies, in ProactiveHea
 	// Coordinator-only checks.
 	coord, err := deps.Pool.Acquire(ctx)
 	if err != nil {
-		return nil, out, nil
+		return nil, out, skipSection("coordinator_unreachable", err.Error())
 	}
 	defer coord.Release()
 

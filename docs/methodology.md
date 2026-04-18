@@ -273,3 +273,54 @@ cases: non-drift, drift, unreachable-node).
 **Inputs exposed.** None new. The refactor is backward-compatible in
 JSON shape: `severity` is now empty-string on non-drifted rows, and a
 new `class` field is added.
+
+## full_report — "tools produced no actionable output" contract (P0-#4)
+
+**The bug.** The aggregator's `run()` wrapper unconditionally added
+every section that didn't return a hard error to `tools_run`, even
+sections that bailed early with empty output (`cluster_summary` when
+citus is not installed; `query_pathology`/`routing_drift_detector` when
+pg_stat_statements is missing or empty; `proactive_health` when the
+coordinator pool acquire fails). `tools_skipped` was populated only
+from the SkipSections input and a couple of manual `append` calls.
+Readers could not distinguish "tool ran and had no findings" from
+"tool silently did nothing".
+
+**The fix.** A uniform contract:
+
+1. `tools_skipped` is now `[]SkipReason { tool, reason, detail }` — a
+   structured list, not `[]string`.
+2. Sections that cannot produce actionable output return
+   `skipSection(reason, detail)`, which produces a sentinel `*skipError`.
+3. The aggregator's `run()` wrapper inspects the error with
+   `errors.As`: a `*skipError` routes the section to `tools_skipped`
+   with the structured reason; a real error routes to `section_errors`;
+   nil routes to `tools_run`.
+4. `tools_skipped` is therefore the **single source of truth** for
+   non-produced output.
+
+Known skip reasons today:
+
+| reason                             | emitted by                               |
+|------------------------------------|------------------------------------------|
+| `user_requested`                   | aggregator, on SkipSections match        |
+| `citus_extension_not_installed`    | cluster_summary path in aggregator       |
+| `coordinator_unreachable`          | proactive_health pool-acquire failure    |
+| `pg_stat_statements_not_installed` | query_pathology, routing_drift_detector  |
+| `no_statements_tracked`            | query_pathology, routing_drift_detector when pg_stat_statements is installed but empty/below thresholds |
+| `no_admin_dsn`                     | pgbouncer_inspector without admin DSN    |
+| `opt_in`                           | synthetic_probe not explicitly enabled   |
+| `needs_target_inputs`              | hardware_sizer without target inputs     |
+
+**Cluster facts that drive this.** None — it is a pure structural
+change to the aggregator. The only per-cluster inputs that matter are
+the boolean "is pg_stat_statements loaded" / "did coordinator pool
+acquire succeed" etc., all already probed by the respective tool.
+
+**Tested.** `full_report_skip_test.go` covers the error-routing table:
+nil → tools_run, `*skipError` → tools_skipped with its reason
+preserved, any other error → section_errors. Verified live on the
+local test cluster: `pg_stat_statements` not installed →
+`query_pathology` and `routing_drift` both appear in `tools_skipped`
+with reason `pg_stat_statements_not_installed`, and neither appears
+in `tools_run`.
