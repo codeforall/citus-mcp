@@ -181,3 +181,61 @@ returned, with the assumption surfaced in `explanation`.
 
 ---
 
+
+---
+
+## citus_session_guardrails
+
+### What it measures
+
+Cluster-level GUCs that are risky in production. Rule severities follow
+a strict discipline: a rule MUST NOT fire at `warning` or `critical` on
+a shipped product default. Doing so erodes operator trust.
+
+### Reading cluster-level values correctly
+
+The obvious query `SELECT current_setting($1)` is **wrong** for this
+tool. The citus-mcp pool itself injects per-connection RuntimeParams
+(see `internal/db/connection.go` line 37:
+`pcfg.ConnConfig.RuntimeParams["statement_timeout"] = ...`), so both
+`current_setting()` and `pg_settings.setting` / `reset_val` reflect the
+pool's override, not the cluster-level value a regular client backend
+would observe.
+
+The tool opens a one-shot `pgx.Conn` with `RuntimeParams = {}` and
+reads GUCs through it. The resulting value reflects `postgresql.conf`
++ `ALTER SYSTEM` + role/db defaults, i.e. what a normal application
+backend sees.
+
+### Rule severities
+
+Source citations for shipped defaults:
+
+- `work_mem` default = 4 MB: `src/backend/utils/misc/guc_tables.c`
+  (`"work_mem"` entry, `boot_val = 4096` kB).
+- `statement_timeout` default = 0 (unbounded): same file.
+- `idle_in_transaction_session_timeout` default = 0: same file.
+- `citus.multi_shard_modify_mode` default = `parallel`:
+  `src/backend/distributed/shared_library_init.c:2210-2218`
+  (`DefineCustomEnumVariable` with `boot_val = PARALLEL_CONNECTION`).
+- `citus.max_adaptive_executor_pool_size` default = 16: same file,
+  `:1986-2001`.
+
+Accordingly:
+
+- `work_mem > 512 MiB` → **warning** (not a default; signal).
+- `statement_timeout = 0` → **info** (product default).
+- `idle_in_transaction_session_timeout = 0` → **info** (default).
+- `citus.multi_shard_modify_mode = parallel` **alone** → NO alarm.
+  This is the product default and the recommended mode for throughput.
+- `citus.multi_shard_modify_mode = parallel` **AND**
+  `citus.max_adaptive_executor_pool_size > adaptive_pool_high` (default
+  32) → **warning**. Only in this combination does a single multi-shard
+  write fan out enough connections per worker to risk exhausting
+  `max_connections`.
+
+### Inputs exposed
+
+- `work_mem_mib_high` — default 512.
+- `adaptive_pool_high` — default 32.
+
