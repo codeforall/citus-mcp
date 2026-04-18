@@ -239,3 +239,37 @@ Accordingly:
 - `work_mem_mib_high` — default 512.
 - `adaptive_pool_high` — default 32.
 
+
+## config_deep_inspect — severity semantics (P0-#3)
+
+**The bug.** Before this fix, every row in `guc_drifts` carried a
+`severity` field that was actually the GUC's *class* (how bad drift
+WOULD be on that GUC). Rows where `drifted=false` still reported
+`severity=critical`, which made "count of critical findings" in any
+consumer unreliable — a cluster with zero drift could appear to have
+a dozen critical items.
+
+**The fix.** Split the two concepts explicitly on `GucDriftReport`:
+
+* `class` — the inherent criticality of drift on this GUC. Always
+  populated. `wal_level` is critical because mismatch breaks logical
+  replication; `timezone` is info because it only affects log
+  timestamps.
+* `severity` — the severity of THIS FINDING. Empty string when
+  `drifted=false` (there IS no finding). Equals `class` when
+  `drifted=true`.
+
+Callers counting findings must look at `severity`; callers sorting
+by inherent criticality (e.g. "show the critical-class GUCs first
+regardless of whether they drifted") should look at `class`. The
+stable sort in `ConfigDeepInspectTool` now keys on `class` for this
+reason.
+
+**Cluster facts that drive this.** Only the `driftRule` table and the
+observed per-node `pg_settings.setting` values. No timing, no memory
+probes. Pure function `buildGucDriftReport` is unit-tested (three
+cases: non-drift, drift, unreachable-node).
+
+**Inputs exposed.** None new. The refactor is backward-compatible in
+JSON shape: `severity` is now empty-string on non-drifted rows, and a
+new `class` field is added.

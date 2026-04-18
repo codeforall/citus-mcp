@@ -109,14 +109,26 @@ type ConfigDeepInspectOutput struct {
 	Warnings  []string            `json:"warnings,omitempty"`
 }
 
-// GucDriftReport is one GUC's per-node picture.
+// GucDriftReport is one GUC's per-node picture. Two severity fields are
+// exposed to avoid the class-vs-finding confusion:
+//
+//   - `Class` describes the inherent criticality of this GUC IF it drifts
+//     (e.g. wal_level is critical because a mismatch breaks logical
+//     replication; timezone is info because it only affects log
+//     timestamps). Class never depends on whether the GUC drifted here.
+//
+//   - `Severity` is the SEVERITY OF THIS FINDING: empty string when the
+//     GUC did not drift on this cluster (there IS no finding), otherwise
+//     equal to Class. Consumers that want to know "is there something
+//     wrong here" must check Severity, not Class.
 type GucDriftReport struct {
-	GUC        string            `json:"guc"`
-	Severity   string            `json:"severity"`
-	Note       string            `json:"note"`
-	Values     map[string]string `json:"values"` // "coordinator" / "host:port" -> value
-	DistinctValues int           `json:"distinct_values"`
-	Drifted    bool              `json:"drifted"`
+	GUC            string            `json:"guc"`
+	Class          string            `json:"class"`
+	Severity       string            `json:"severity"` // empty when Drifted=false
+	Note           string            `json:"note"`
+	Values         map[string]string `json:"values"` // "coordinator" / "host:port" -> value
+	DistinctValues int               `json:"distinct_values"`
+	Drifted        bool              `json:"drifted"`
 }
 
 // DriftSummary aggregates top-level counts.
@@ -217,20 +229,7 @@ func ConfigDeepInspectTool(ctx context.Context, deps Dependencies, in ConfigDeep
 	// For each rule, build the per-node map and decide drift.
 	out.Summary.TotalGucs = len(rules)
 	for _, r := range rules {
-		rep := GucDriftReport{GUC: r.Name, Severity: string(r.Severity), Note: r.Note, Values: map[string]string{}}
-		distinct := map[string]bool{}
-		for nodeKey, vals := range nodeValues {
-			v, ok := vals[r.Name]
-			if !ok {
-				v = "(not set / unreachable)"
-			}
-			rep.Values[nodeKey] = v
-			if ok {
-				distinct[v] = true
-			}
-		}
-		rep.DistinctValues = len(distinct)
-		rep.Drifted = rep.DistinctValues > 1
+		rep := buildGucDriftReport(r, nodeValues)
 		if rep.Drifted {
 			out.Summary.DriftedGucs++
 			switch r.Severity {
@@ -271,19 +270,54 @@ func ConfigDeepInspectTool(ctx context.Context, deps Dependencies, in ConfigDeep
 		out.GucDrifts = append(out.GucDrifts, rep)
 	}
 
-	// Stable order: drifted first, then by severity, then alphabetical.
-	sevRank := map[string]int{"critical": 0, "warning": 1, "info": 2}
+	// Stable order: drifted first, then by class (criticality of this GUC
+	// if it were to drift), then alphabetical. Sorting by Severity (the
+	// finding severity) would put all non-drifted rows in one
+	// indistinguishable empty-severity bucket.
+	classRank := map[string]int{"critical": 0, "warning": 1, "info": 2}
 	sort.SliceStable(out.GucDrifts, func(i, j int) bool {
 		a, b := out.GucDrifts[i], out.GucDrifts[j]
 		if a.Drifted != b.Drifted {
 			return a.Drifted
 		}
-		if sevRank[a.Severity] != sevRank[b.Severity] {
-			return sevRank[a.Severity] < sevRank[b.Severity]
+		if classRank[a.Class] != classRank[b.Class] {
+			return classRank[a.Class] < classRank[b.Class]
 		}
 		return a.GUC < b.GUC
 	})
 
 	_ = serr.CodeInternalError // silence import if unused
 	return nil, out, nil
+}
+
+// buildGucDriftReport computes a per-GUC drift report from the per-node
+// value map. Exposed as a pure helper so P0-#3 severity semantics can be
+// unit-tested without a live cluster: severity must equal class when a
+// drift is detected, and must be the empty string otherwise. See
+// docs/methodology.md "config_deep_inspect — severity semantics" for the
+// rationale.
+func buildGucDriftReport(r driftRule, nodeValues map[string]map[string]string) GucDriftReport {
+rep := GucDriftReport{
+GUC:    r.Name,
+Class:  string(r.Severity),
+Note:   r.Note,
+Values: map[string]string{},
+}
+distinct := map[string]bool{}
+for nodeKey, vals := range nodeValues {
+v, ok := vals[r.Name]
+if !ok {
+v = "(not set / unreachable)"
+}
+rep.Values[nodeKey] = v
+if ok {
+distinct[v] = true
+}
+}
+rep.DistinctValues = len(distinct)
+rep.Drifted = rep.DistinctValues > 1
+if rep.Drifted {
+rep.Severity = rep.Class
+}
+return rep
 }
