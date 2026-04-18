@@ -16,6 +16,33 @@ func TestTruncateMsg(t *testing.T) {
 	}
 }
 
+func TestBlockerIsDDL(t *testing.T) {
+	cases := []struct {
+		name    string
+		queries []string
+		modes   []string
+		want    bool
+	}{
+		{"empty", nil, nil, false},
+		{"plain SELECT with RowShare", []string{"SELECT * FROM t"}, []string{"AccessShareLock"}, false},
+		{"ALTER TABLE query prefix", []string{"ALTER TABLE t ADD COLUMN c int"}, []string{"RowExclusiveLock"}, true},
+		{"DROP INDEX prefix", []string{"drop index concurrently i"}, []string{""}, true},
+		{"blocker holds AccessExclusiveLock", []string{"SELECT 1"}, []string{"AccessExclusiveLock"}, true},
+		{"plain UPDATE blocking AccessExclusive (regression: must NOT be DDL)",
+			[]string{"UPDATE t SET c = 1"}, []string{"RowExclusiveLock"}, false},
+		{"lowercase VACUUM FULL", []string{"vacuum full t"}, []string{""}, true},
+		{"TRUNCATE", []string{"TRUNCATE t"}, []string{""}, true},
+		{"any-of-many DDL", []string{"SELECT 1", "ALTER TABLE t ADD COLUMN c int"}, []string{"", ""}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := blockerIsDDL(c.queries, c.modes); got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestBuildRebalancePlaybook(t *testing.T) {
 	cases := []struct {
 		class       string

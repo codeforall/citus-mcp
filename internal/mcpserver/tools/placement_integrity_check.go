@@ -446,18 +446,20 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 			// instead of suppressing — this is the most common "why is my
 			// rebalancer making bad decisions?" signal.
 			if e.shardLen == 0 && a.bytes > 0 {
-				out.StaleStats = append(out.StaleStats, SizeDrift{
-					PlacementID:  e.placementID,
-					ShardID:      e.shardID,
-					NodeName:     e.nodeName,
-					NodePort:     e.nodePort,
-					Relation:     a.schema + "." + a.relname,
-					MetadataSize: 0,
-					ActualSize:   a.bytes,
-					DriftRatio:   0, // undefined; metadata=0
-				})
-				if len(out.StaleStats) >= in.MaxRowsPerClass {
-					out.Truncated["stale_stats"] = true
+				if !out.Truncated["stale_stats"] {
+					out.StaleStats = append(out.StaleStats, SizeDrift{
+						PlacementID:  e.placementID,
+						ShardID:      e.shardID,
+						NodeName:     e.nodeName,
+						NodePort:     e.nodePort,
+						Relation:     a.schema + "." + a.relname,
+						MetadataSize: 0,
+						ActualSize:   a.bytes,
+						DriftRatio:   0, // undefined; metadata=0
+					})
+					if len(out.StaleStats) >= in.MaxRowsPerClass {
+						out.Truncated["stale_stats"] = true
+					}
 				}
 				continue
 			}
@@ -592,8 +594,9 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 	// -------- 9. Playbook.
 	buildPlacementPlaybook(&out)
 
-	if len(out.GhostPlacements)+len(out.OrphanTables)+len(out.InactiveWithData)+len(out.SizeDrifts) == 0 &&
-		len(out.CleanupRecords) == 0 {
+	if len(out.GhostPlacements)+len(out.OrphanTables)+len(out.InactiveWithData)+
+		len(out.SizeDrifts)+len(out.StaleStats) == 0 &&
+		len(out.CleanupRecords) == 0 && !out.PartialResults {
 		out.Recommendations = append(out.Recommendations,
 			"Placement metadata and on-disk state are fully consistent.")
 	}
@@ -602,6 +605,13 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 }
 
 func buildPlacementPlaybook(out *PlacementIntegrityOutput) {
+	if out.PartialResults {
+		out.Playbook = append(out.Playbook,
+			"PARTIAL RESULTS — one or more workers were unreachable during fanout:",
+			"  Ghost/orphan/size-drift detection was suppressed for those nodes.",
+			"  Verify worker health and re-run:",
+			"    SELECT * FROM citus_check_cluster_node_health();")
+	}
 	if len(out.GhostPlacements) > 0 {
 		out.Playbook = append(out.Playbook,
 			"GHOST PLACEMENTS — metadata references shards that don't exist on disk:",
@@ -634,7 +644,15 @@ func buildPlacementPlaybook(out *PlacementIntegrityOutput) {
 			"SIZE DRIFT — placement.shardlength is stale compared to on-disk size:",
 			"  SELECT citus_update_shard_statistics(<shardid>);  -- refreshes shardlength")
 	}
-	if len(out.GhostPlacements)+len(out.OrphanTables)+len(out.InactiveWithData)+len(out.SizeDrifts) == 0 {
+	if len(out.StaleStats) > 0 {
+		out.Playbook = append(out.Playbook,
+			"STALE STATS — placement.shardlength = 0 but disk has data:",
+			"  Rebalancer decisions depend on shardlength; refresh statistics before any rebalance:",
+			"    SELECT citus_update_shard_statistics(<shardid>);      -- per shard, or",
+			"    SELECT citus_update_table_statistics('<relation>');   -- per table.")
+	}
+	if len(out.GhostPlacements)+len(out.OrphanTables)+len(out.InactiveWithData)+
+		len(out.SizeDrifts)+len(out.StaleStats) == 0 && !out.PartialResults {
 		out.Playbook = append(out.Playbook, "No integrity issues found; metadata and on-disk state agree.")
 	}
 }

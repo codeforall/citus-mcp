@@ -97,3 +97,39 @@ func TestBuildPlacementPlaybook(t *testing.T) {
 		t.Errorf("empty playbook wrong: %v", empty.Playbook)
 	}
 }
+
+func TestPlacementPlaybookStaleStats(t *testing.T) {
+	// Regression: stale_stats alone must trigger its own playbook entry,
+	// not fall through to the "no integrity issues" message.
+	o := &PlacementIntegrityOutput{
+		StaleStats:      []SizeDrift{{ShardID: 1}},
+		Playbook:        []string{},
+		Recommendations: []string{},
+	}
+	buildPlacementPlaybook(o)
+	joined := strings.Join(o.Playbook, "\n")
+	if !strings.Contains(joined, "STALE STATS") {
+		t.Errorf("expected STALE STATS playbook section; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "No integrity issues") {
+		t.Errorf("stale_stats-only output must NOT say 'No integrity issues'; got:\n%s", joined)
+	}
+}
+
+func TestPlacementPlaybookPartialResults(t *testing.T) {
+	// Regression: PartialResults must produce its own playbook section and
+	// suppress the "no issues" message — even when every other class is empty.
+	o := &PlacementIntegrityOutput{
+		PartialResults:  true,
+		Playbook:        []string{},
+		Recommendations: []string{},
+	}
+	buildPlacementPlaybook(o)
+	joined := strings.Join(o.Playbook, "\n")
+	if !strings.Contains(joined, "PARTIAL RESULTS") {
+		t.Errorf("expected PARTIAL RESULTS section; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "No integrity issues") {
+		t.Errorf("partial_results output must NOT say 'No integrity issues'; got:\n%s", joined)
+	}
+}
