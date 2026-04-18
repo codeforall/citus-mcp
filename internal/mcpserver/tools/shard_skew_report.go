@@ -28,12 +28,16 @@ type ShardSkewInput struct {
 
 // ShardSkewOutput result.
 type ShardSkewOutput struct {
-	PerNode         []NodeSkewSummary        `json:"per_node"`
-	Skew            SkewScore                `json:"skew"`
-	PerColocation   []ColocationSkewSummary  `json:"per_colocation,omitempty"`
-	HotShards       []HotShard               `json:"hot_shards,omitempty"`
-	TopShards       []TopShard               `json:"top_shards,omitempty"`
-	Warnings        []string                 `json:"warnings,omitempty"`
+	PerNode       []NodeSkewSummary       `json:"per_node"`
+	Skew          SkewScore               `json:"skew"`
+	PerColocation []ColocationSkewSummary `json:"per_colocation,omitempty"`
+	HotShards     []HotShard              `json:"hot_shards,omitempty"`
+	TopShards     []TopShard              `json:"top_shards,omitempty"`
+	// DataHoldingNodeCount is the number of pg_dist_node rows with
+	// shouldhaveshards=true AND isactive=true AND noderole='primary'.
+	// Cluster-wide skew is only meaningful when this is >= 2.
+	DataHoldingNodeCount int      `json:"data_holding_node_count"`
+	Warnings             []string `json:"warnings,omitempty"`
 }
 
 type NodeSkewSummary struct {
@@ -42,10 +46,19 @@ type NodeSkewSummary struct {
 	ShardCount       int64   `json:"shard_count"`
 	BytesTotal       int64   `json:"bytes_total"`
 	BytesAvgPerShard float64 `json:"bytes_avg_per_shard"`
+	// ShouldHaveShards mirrors pg_dist_node.shouldhaveshards. This is the
+	// authoritative signal the Citus rebalancer itself uses to decide which
+	// nodes are "data-holding" (see src/backend/distributed/operations/
+	// shard_rebalancer.c:567 and :651). Only shouldhaveshards=true nodes are
+	// part of the cluster-wide skew metric; coordinators and drained nodes
+	// are reported per-node but excluded from the cluster aggregate.
+	ShouldHaveShards bool `json:"should_have_shards"`
+	// NodeRole mirrors pg_dist_node.noderole ('primary' | 'secondary').
+	NodeRole string `json:"node_role,omitempty"`
 	// OnlyReferenceTables is true when every placement on this node belongs
-	// to a reference table. Such nodes (typically the coordinator) carry
-	// only the 1-shard ref-table copies; including them in cluster-wide
-	// skew math produces a false-positive "high skew" on any mixed cluster.
+	// to a reference table. Kept as a secondary signal for UI / explanation
+	// (typical for coordinators with should_have_shards=false that still
+	// carry ref-table copies).
 	OnlyReferenceTables bool `json:"only_reference_tables"`
 }
 
@@ -184,19 +197,50 @@ func shardSkewReportTool(ctx context.Context, deps Dependencies, input ShardSkew
 		metric = "shard_count"
 	}
 
+	// Fetch pg_dist_node to know which nodes are "data-holding" from Citus's
+	// own perspective. The rebalancer source uses shouldhaveshards as the
+	// authoritative filter (src/backend/distributed/operations/
+	// shard_rebalancer.c:567,651) so we adopt it here to avoid the
+	// coord-masquerading-as-a-skewed-worker false positive.
+	nodeMeta, err := fetchDistNodeMeta(ctx, deps)
+	if err != nil {
+		deps.Logger.Warn("pg_dist_node fetch failed", zap.Error(err))
+		warnings = append(warnings, "pg_dist_node fetch failed; falling back to placement-derived node set")
+		nodeMeta = map[string]distNodeMeta{}
+	}
+
 	// Per-node: count shards and bytes; remember whether a node holds ONLY
-	// reference-table placements (which is normal for the coordinator and
-	// must not count as "skew").
+	// reference-table placements (secondary signal for UI).
 	type nodeAcc struct {
 		*NodeSkewSummary
 		sawDistributed bool
 	}
 	perNode := map[string]*nodeAcc{}
+	// Seed with every pg_dist_node row so we surface data-holding workers
+	// that happen to have zero placements (e.g. brand-new node waiting for
+	// rebalance). Without this such a node would be invisible in the report.
+	for key, m := range nodeMeta {
+		perNode[key] = &nodeAcc{NodeSkewSummary: &NodeSkewSummary{
+			Host:                m.Host,
+			Port:                m.Port,
+			ShouldHaveShards:    m.ShouldHaveShards,
+			NodeRole:            m.NodeRole,
+			OnlyReferenceTables: true,
+		}}
+		_ = key
+	}
 	for _, shp := range shards {
 		key := shp.Host + ":" + strconv.Itoa(int(shp.Port))
 		ns, ok := perNode[key]
 		if !ok {
-			ns = &nodeAcc{NodeSkewSummary: &NodeSkewSummary{Host: shp.Host, Port: shp.Port, OnlyReferenceTables: true}}
+			// Placement exists on a node that is not in pg_dist_node or is
+			// not primary. Preserve it in per_node output but default
+			// shouldhaveshards=false so it does NOT poison the cluster metric.
+			ns = &nodeAcc{NodeSkewSummary: &NodeSkewSummary{
+				Host:                shp.Host,
+				Port:                shp.Port,
+				OnlyReferenceTables: true,
+			}}
 			perNode[key] = ns
 		}
 		ns.ShardCount++
@@ -211,18 +255,19 @@ func shardSkewReportTool(ctx context.Context, deps Dependencies, input ShardSkew
 
 	nodeSummaries := make([]NodeSkewSummary, 0, len(perNode))
 	metricVals := []float64{}
+	dataHolding := 0
 	for _, ns := range perNode {
 		if ns.ShardCount > 0 {
 			ns.BytesAvgPerShard = float64(ns.BytesTotal) / float64(ns.ShardCount)
 		}
 		nodeSummaries = append(nodeSummaries, *ns.NodeSkewSummary)
-		// Exclude reference-table-only nodes (e.g. coordinator in MX-worker
-		// deployments) from the cluster-wide skew metric. Including them
-		// produces a guaranteed false-positive "high skew" on any cluster
-		// with a reference table.
-		if ns.OnlyReferenceTables {
+		// Cluster-wide skew is defined only across data-holding primary
+		// nodes (shouldhaveshards=true). Drained nodes, coordinators with
+		// should_have_shards=false, and secondaries are excluded.
+		if !ns.ShouldHaveShards {
 			continue
 		}
+		dataHolding++
 		if metricBytes {
 			metricVals = append(metricVals, float64(ns.BytesTotal))
 		} else {
@@ -236,7 +281,13 @@ func shardSkewReportTool(ctx context.Context, deps Dependencies, input ShardSkew
 		return nodeSummaries[i].Host < nodeSummaries[j].Host
 	})
 
-	skew := computeSkew(metricVals, metric)
+	// When only 0 or 1 data-holding nodes exist the cluster-wide skew
+	// metric is structurally meaningless (max==min, stddev==0 always).
+	// Surface this explicitly instead of reporting a bogus "low skew" ok.
+	skew, degenWarn := clusterSkewDecision(metricVals, metric, dataHolding)
+	if degenWarn != "" {
+		warnings = append(warnings, degenWarn)
+	}
 
 	// Per-colocation skew: the primary signal for a skewed distribution key.
 	// We compute max/avg bytes within each colocation group, flag CRITICAL
@@ -264,13 +315,64 @@ func shardSkewReportTool(ctx context.Context, deps Dependencies, input ShardSkew
 		warnings = []string{}
 	}
 	return nil, ShardSkewOutput{
-		PerNode:       nodeSummaries,
-		Skew:          skew,
-		PerColocation: perColocation,
-		HotShards:     hotShards,
-		TopShards:     topShards,
-		Warnings:      warnings,
+		PerNode:              nodeSummaries,
+		Skew:                 skew,
+		PerColocation:        perColocation,
+		HotShards:            hotShards,
+		TopShards:            topShards,
+		DataHoldingNodeCount: dataHolding,
+		Warnings:             warnings,
 	}, nil
+}
+
+// distNodeMeta is the subset of pg_dist_node we need for skew decisions.
+type distNodeMeta struct {
+	Host             string
+	Port             int32
+	NodeRole         string
+	ShouldHaveShards bool
+	IsActive         bool
+}
+
+// clusterSkewDecision centralizes the "is the cluster-wide skew metric even
+// meaningful?" rule: if 0 or 1 pg_dist_node rows have shouldhaveshards=true,
+// max==min by definition and a "low skew / ok" verdict would be misleading.
+// In those cases we return a single_data_node SkewScore plus a warning
+// pointing the operator at per_colocation instead. Otherwise we compute the
+// normal metric.
+func clusterSkewDecision(metricVals []float64, metric string, dataHoldingCount int) (SkewScore, string) {
+	if dataHoldingCount < 2 {
+		warn := "only one data-holding node; cluster-wide skew metric is N/A. Use per_colocation to detect key-level skew."
+		if dataHoldingCount == 0 {
+			warn = "no node has pg_dist_node.shouldhaveshards=true; cluster-wide skew metric is N/A. Use per_colocation instead."
+		}
+		return SkewScore{Metric: metric, Warning: "single_data_node"}, warn
+	}
+	return computeSkew(metricVals, metric), ""
+}
+
+// fetchDistNodeMeta returns one entry per primary active node keyed by
+// "host:port". Citus's own rebalancer uses shouldhaveshards as the filter for
+// shard-holding nodes (shard_rebalancer.c:567,651), so we adopt the same
+// signal here.
+func fetchDistNodeMeta(ctx context.Context, deps Dependencies) (map[string]distNodeMeta, error) {
+	q := `SELECT nodename, nodeport, noderole::text, shouldhaveshards, isactive
+	      FROM pg_catalog.pg_dist_node
+	      WHERE isactive = true AND noderole = 'primary'`
+	rows, err := deps.Pool.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]distNodeMeta{}
+	for rows.Next() {
+		var m distNodeMeta
+		if err := rows.Scan(&m.Host, &m.Port, &m.NodeRole, &m.ShouldHaveShards, &m.IsActive); err != nil {
+			return nil, err
+		}
+		out[m.Host+":"+strconv.Itoa(int(m.Port))] = m
+	}
+	return out, rows.Err()
 }
 
 // ShardSkewReport is exported for resources.

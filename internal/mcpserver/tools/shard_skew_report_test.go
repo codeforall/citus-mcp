@@ -75,3 +75,44 @@ func TestBuildHotShardsSkipsSingleShardTable(t *testing.T) {
 		t.Errorf("single-shard tables cannot be skewed by definition; got %d hot shards", len(got))
 	}
 }
+
+// TestClusterSkewDecisionSingleDataNode covers the P0 fix where a
+// coordinator with shouldhaveshards=false must not count as a data-holding
+// node for cluster-wide skew. With one real worker the metric is undefined.
+func TestClusterSkewDecisionSingleDataNode(t *testing.T) {
+	s, warn := clusterSkewDecision([]float64{41222144}, "bytes", 1)
+	if s.Warning != "single_data_node" {
+		t.Errorf("want warning 'single_data_node', got %q", s.Warning)
+	}
+	if s.Max != 0 || s.Min != 0 {
+		t.Errorf("single-data-node score must not report numeric min/max; got min=%v max=%v", s.Min, s.Max)
+	}
+	if warn == "" {
+		t.Error("expected a human-readable warning explaining per_colocation fallback")
+	}
+}
+
+func TestClusterSkewDecisionNoDataNodes(t *testing.T) {
+	s, warn := clusterSkewDecision(nil, "bytes", 0)
+	if s.Warning != "single_data_node" {
+		t.Errorf("got %q", s.Warning)
+	}
+	if warn == "" || warn[:2] != "no" {
+		t.Errorf("want 'no node has ...' message, got %q", warn)
+	}
+}
+
+func TestClusterSkewDecisionMultiNodeComputes(t *testing.T) {
+	// 3 data-holding nodes, different byte totals — metric must be computed,
+	// no degenerate warning.
+	s, warn := clusterSkewDecision([]float64{100, 400, 200}, "bytes", 3)
+	if warn != "" {
+		t.Errorf("unexpected degenerate warning: %q", warn)
+	}
+	if s.Max != 400 || s.Min != 100 {
+		t.Errorf("max/min not populated; got %+v", s)
+	}
+	if s.Warning == "single_data_node" {
+		t.Error("multi-node decision must not tag single_data_node")
+	}
+}
