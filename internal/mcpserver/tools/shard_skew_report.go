@@ -28,10 +28,12 @@ type ShardSkewInput struct {
 
 // ShardSkewOutput result.
 type ShardSkewOutput struct {
-	PerNode   []NodeSkewSummary `json:"per_node"`
-	Skew      SkewScore         `json:"skew"`
-	TopShards []TopShard        `json:"top_shards,omitempty"`
-	Warnings  []string          `json:"warnings,omitempty"`
+	PerNode         []NodeSkewSummary        `json:"per_node"`
+	Skew            SkewScore                `json:"skew"`
+	PerColocation   []ColocationSkewSummary  `json:"per_colocation,omitempty"`
+	HotShards       []HotShard               `json:"hot_shards,omitempty"`
+	TopShards       []TopShard               `json:"top_shards,omitempty"`
+	Warnings        []string                 `json:"warnings,omitempty"`
 }
 
 type NodeSkewSummary struct {
@@ -40,6 +42,40 @@ type NodeSkewSummary struct {
 	ShardCount       int64   `json:"shard_count"`
 	BytesTotal       int64   `json:"bytes_total"`
 	BytesAvgPerShard float64 `json:"bytes_avg_per_shard"`
+	// OnlyReferenceTables is true when every placement on this node belongs
+	// to a reference table. Such nodes (typically the coordinator) carry
+	// only the 1-shard ref-table copies; including them in cluster-wide
+	// skew math produces a false-positive "high skew" on any mixed cluster.
+	OnlyReferenceTables bool `json:"only_reference_tables"`
+}
+
+// ColocationSkewSummary reports bytes skew within a single colocation group.
+// This is the signal that matters most for hot-tenant detection: uneven hash
+// distribution within a colocation group caused by a skewed distribution key
+// manifests as max/avg >> 1 on THIS table, not at the node level.
+type ColocationSkewSummary struct {
+	ColocationID  int64    `json:"colocation_id"`
+	Tables        []string `json:"tables"`
+	Shards        int      `json:"shards"`
+	BytesTotal    int64    `json:"bytes_total"`
+	BytesMax      int64    `json:"bytes_max"`
+	BytesAvg      float64  `json:"bytes_avg"`
+	MaxOverAvg    float64  `json:"max_over_avg"`
+	Verdict       string   `json:"verdict"` // ok | warn | critical
+	HotShardID    int64    `json:"hot_shard_id,omitempty"`
+}
+
+// HotShard is a single shard whose size is a large multiple of its peers
+// within the same table. Typically indicates a "hot tenant" — i.e. the
+// distribution key concentrates traffic on one value. Remediation is
+// isolate_tenant_to_new_shard(...).
+type HotShard struct {
+	TableName   string  `json:"table_name"`
+	ShardID     int64   `json:"shard_id"`
+	Bytes       int64   `json:"bytes"`
+	TableAvg    float64 `json:"table_avg_bytes"`
+	Ratio       float64 `json:"max_over_avg"`
+	Remediation string  `json:"remediation"`
 }
 
 type SkewScore struct {
@@ -113,7 +149,7 @@ func shardSkewReportTool(ctx context.Context, deps Dependencies, input ShardSkew
 		}
 	}
 
-	// fetch shards and placements
+	// fetch shards and placements (with table metadata)
 	shards, err := fetchShardPlacements(ctx, deps, schema, table)
 	if err != nil {
 		return callError(serr.CodeInternalError, err.Error(), "fetch shard placements"), ShardSkewOutput{PerNode: []NodeSkewSummary{}}, nil
@@ -148,17 +184,28 @@ func shardSkewReportTool(ctx context.Context, deps Dependencies, input ShardSkew
 		metric = "shard_count"
 	}
 
-	perNode := map[string]*NodeSkewSummary{}
+	// Per-node: count shards and bytes; remember whether a node holds ONLY
+	// reference-table placements (which is normal for the coordinator and
+	// must not count as "skew").
+	type nodeAcc struct {
+		*NodeSkewSummary
+		sawDistributed bool
+	}
+	perNode := map[string]*nodeAcc{}
 	for _, shp := range shards {
 		key := shp.Host + ":" + strconv.Itoa(int(shp.Port))
 		ns, ok := perNode[key]
 		if !ok {
-			ns = &NodeSkewSummary{Host: shp.Host, Port: shp.Port}
+			ns = &nodeAcc{NodeSkewSummary: &NodeSkewSummary{Host: shp.Host, Port: shp.Port, OnlyReferenceTables: true}}
 			perNode[key] = ns
 		}
 		ns.ShardCount++
 		if metricBytes && shardBytes[shp.ShardID] > 0 {
 			ns.BytesTotal += shardBytes[shp.ShardID]
+		}
+		if !shp.IsReference {
+			ns.sawDistributed = true
+			ns.OnlyReferenceTables = false
 		}
 	}
 
@@ -168,7 +215,14 @@ func shardSkewReportTool(ctx context.Context, deps Dependencies, input ShardSkew
 		if ns.ShardCount > 0 {
 			ns.BytesAvgPerShard = float64(ns.BytesTotal) / float64(ns.ShardCount)
 		}
-		nodeSummaries = append(nodeSummaries, *ns)
+		nodeSummaries = append(nodeSummaries, *ns.NodeSkewSummary)
+		// Exclude reference-table-only nodes (e.g. coordinator in MX-worker
+		// deployments) from the cluster-wide skew metric. Including them
+		// produces a guaranteed false-positive "high skew" on any cluster
+		// with a reference table.
+		if ns.OnlyReferenceTables {
+			continue
+		}
 		if metricBytes {
 			metricVals = append(metricVals, float64(ns.BytesTotal))
 		} else {
@@ -183,6 +237,16 @@ func shardSkewReportTool(ctx context.Context, deps Dependencies, input ShardSkew
 	})
 
 	skew := computeSkew(metricVals, metric)
+
+	// Per-colocation skew: the primary signal for a skewed distribution key.
+	// We compute max/avg bytes within each colocation group, flag CRITICAL
+	// at ratio >= 5.0, WARN at >= 2.0.
+	var perColocation []ColocationSkewSummary
+	var hotShards []HotShard
+	if metricBytes && len(shardBytes) > 0 && len(shards) > 0 {
+		perColocation = buildColocationSkew(shards, shardBytes)
+		hotShards = buildHotShards(shards, shardBytes, 10)
+	}
 
 	var topShards []TopShard
 	if input.IncludeTopShards && len(shardBytes) > 0 {
@@ -199,10 +263,14 @@ func shardSkewReportTool(ctx context.Context, deps Dependencies, input ShardSkew
 	if warnings == nil {
 		warnings = []string{}
 	}
-	if len(warnings) > 0 {
-		return nil, ShardSkewOutput{PerNode: nodeSummaries, Skew: skew, TopShards: topShards, Warnings: warnings}, nil
-	}
-	return nil, ShardSkewOutput{PerNode: nodeSummaries, Skew: skew, TopShards: topShards}, nil
+	return nil, ShardSkewOutput{
+		PerNode:       nodeSummaries,
+		Skew:          skew,
+		PerColocation: perColocation,
+		HotShards:     hotShards,
+		TopShards:     topShards,
+		Warnings:      warnings,
+	}, nil
 }
 
 // ShardSkewReport is exported for resources.
@@ -211,18 +279,29 @@ func ShardSkewReport(ctx context.Context, deps Dependencies, input ShardSkewInpu
 }
 
 type shardPlacementRow struct {
-	ShardID int64
-	Host    string
-	Port    int32
+	ShardID      int64
+	Host         string
+	Port         int32
+	TableName    string
+	ColocationID int64
+	IsReference  bool
 }
 
 func fetchShardPlacements(ctx context.Context, deps Dependencies, schema, table string) ([]shardPlacementRow, error) {
+	// Join pg_dist_partition to pull colocation + partmethod for each shard.
+	// partmethod = 'n' means reference table (see citus_tables.c).
 	q := `
-SELECT s.shardid, p.nodename, p.nodeport
+SELECT s.shardid,
+       p.nodename,
+       p.nodeport,
+       ns.nspname || '.' || c.relname AS table_name,
+       COALESCE(dp.colocationid, 0)  AS colocationid,
+       COALESCE(dp.partmethod::text, '')   AS partmethod
 FROM pg_dist_shard s
 JOIN pg_dist_shard_placement p USING (shardid)
 JOIN pg_class c ON c.oid = s.logicalrelid
 JOIN pg_namespace ns ON ns.oid = c.relnamespace
+LEFT JOIN pg_dist_partition dp ON dp.logicalrelid = s.logicalrelid
 WHERE ($1 = '' OR (ns.nspname = $1::name AND c.relname = $2::name))
 `
 	rows, err := deps.Pool.Query(ctx, q, schema, table)
@@ -233,9 +312,11 @@ WHERE ($1 = '' OR (ns.nspname = $1::name AND c.relname = $2::name))
 	var out []shardPlacementRow
 	for rows.Next() {
 		var r shardPlacementRow
-		if err := rows.Scan(&r.ShardID, &r.Host, &r.Port); err != nil {
+		var partmethod string
+		if err := rows.Scan(&r.ShardID, &r.Host, &r.Port, &r.TableName, &r.ColocationID, &partmethod); err != nil {
 			return nil, err
 		}
+		r.IsReference = (partmethod == "n")
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -340,6 +421,142 @@ func buildTopShards(shardBytes map[int64]int64, placements []shardPlacementRow, 
 	out := make([]TopShard, 0, len(pairs))
 	for _, p := range pairs {
 		out = append(out, TopShard{ShardID: p.id, Bytes: p.b, Placements: placeByShard[p.id]})
+	}
+	return out
+}
+
+// buildColocationSkew computes max/avg shard-bytes within each colocation
+// group. A ratio >> 1 is the primary signal of a skewed distribution key:
+// hash-distributed shards should be roughly equal within a colocation group,
+// so one shard being much larger than its peers usually means one hash value
+// (one tenant) absorbs a disproportionate share of traffic. Reference tables
+// (colocation_id=0 on our unified query path, or partmethod='n') are skipped
+// because they have only 1 shard per relation.
+func buildColocationSkew(shards []shardPlacementRow, shardBytes map[int64]int64) []ColocationSkewSummary {
+	type agg struct {
+		tables map[string]struct{}
+		bytes  []int64
+		total  int64
+		max    int64
+		maxSh  int64
+	}
+	byColo := map[int64]*agg{}
+	seen := map[int64]struct{}{}
+	for _, shp := range shards {
+		if shp.IsReference || shp.ColocationID == 0 {
+			continue
+		}
+		// Avoid double-counting replicas: only consider each shardid once.
+		if _, ok := seen[shp.ShardID]; ok {
+			continue
+		}
+		seen[shp.ShardID] = struct{}{}
+		a, ok := byColo[shp.ColocationID]
+		if !ok {
+			a = &agg{tables: map[string]struct{}{}}
+			byColo[shp.ColocationID] = a
+		}
+		a.tables[shp.TableName] = struct{}{}
+		b := shardBytes[shp.ShardID]
+		a.bytes = append(a.bytes, b)
+		a.total += b
+		if b > a.max {
+			a.max = b
+			a.maxSh = shp.ShardID
+		}
+	}
+	out := make([]ColocationSkewSummary, 0, len(byColo))
+	for colo, a := range byColo {
+		if len(a.bytes) == 0 {
+			continue
+		}
+		avg := float64(a.total) / float64(len(a.bytes))
+		ratio := 0.0
+		if avg > 0 {
+			ratio = float64(a.max) / avg
+		}
+		verdict := "ok"
+		switch {
+		case ratio >= 5.0:
+			verdict = "critical"
+		case ratio >= 2.0:
+			verdict = "warn"
+		}
+		tables := make([]string, 0, len(a.tables))
+		for t := range a.tables {
+			tables = append(tables, t)
+		}
+		sort.Strings(tables)
+		s := ColocationSkewSummary{
+			ColocationID: colo, Tables: tables,
+			Shards: len(a.bytes), BytesTotal: a.total,
+			BytesMax: a.max, BytesAvg: avg, MaxOverAvg: ratio,
+			Verdict: verdict,
+		}
+		if verdict != "ok" {
+			s.HotShardID = a.maxSh
+		}
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].MaxOverAvg > out[j].MaxOverAvg })
+	return out
+}
+
+// buildHotShards surfaces per-table hot shards: shards whose bytes are
+// >= 2× the table's average. Emits a ready-to-run isolate_tenant_to_new_shard
+// suggestion. Reference tables are skipped.
+func buildHotShards(shards []shardPlacementRow, shardBytes map[int64]int64, limit int) []HotShard {
+	type perTable struct {
+		name   string
+		shards []int64
+		total  int64
+	}
+	byTable := map[string]*perTable{}
+	seen := map[int64]struct{}{}
+	for _, shp := range shards {
+		if shp.IsReference {
+			continue
+		}
+		if _, ok := seen[shp.ShardID]; ok {
+			continue
+		}
+		seen[shp.ShardID] = struct{}{}
+		pt, ok := byTable[shp.TableName]
+		if !ok {
+			pt = &perTable{name: shp.TableName}
+			byTable[shp.TableName] = pt
+		}
+		b := shardBytes[shp.ShardID]
+		pt.shards = append(pt.shards, shp.ShardID)
+		pt.total += b
+	}
+	var out []HotShard
+	for _, pt := range byTable {
+		if len(pt.shards) < 2 {
+			continue // single-shard tables can't be "skewed"
+		}
+		avg := float64(pt.total) / float64(len(pt.shards))
+		if avg == 0 {
+			continue
+		}
+		for _, sh := range pt.shards {
+			b := shardBytes[sh]
+			ratio := float64(b) / avg
+			if ratio < 2.0 {
+				continue
+			}
+			out = append(out, HotShard{
+				TableName: pt.name, ShardID: sh, Bytes: b,
+				TableAvg: avg, Ratio: ratio,
+				Remediation: fmt.Sprintf(
+					"SELECT isolate_tenant_to_new_shard('%s', <tenant_value>, 'CASCADE');",
+					pt.name),
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Ratio > out[j].Ratio })
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `citus_metadata_sync_risk`: lock-hash capacity now uses PostgreSQL's actual `NLOCKENTS` formula — `max_locks_per_transaction × (MaxBackends + max_prepared_transactions)` where `MaxBackends = max_connections + autovacuum_max_workers + max_worker_processes + max_wal_senders` — instead of the naive `lpt × max_connections`. On a default PG17 install this increases the reported capacity ~3.2× (e.g. 6400 → 20544) and prevents spurious "lock table exhausted" recommendations. Output now includes `max_backends` and `lock_table_capacity` under `coordinator_gucs`.
+- `citus_metadata_sync_risk`: lock-in-tx demand now uses `distributed_tables × (1 + avg_indexes_per_table) + distributed_objects + 16` (with `avg_indexes_per_table` pulled from `pg_dist_partition ⨝ pg_index`) instead of a crude `(tables+objects+colocations) × 1.5` with a `min 64` floor.
+- `citus_shard_skew_report`: reference-table-only nodes (e.g. coordinators that hold only replicated reference tables in MX deployments) are now marked with `only_reference_tables=true` and excluded from the cluster-wide skew metric. Previously every cluster with a reference table reported a false-positive "high skew" warning.
+- `citus_shard_skew_report`: added per-colocation skew analysis (`per_colocation[]` with `max/avg` ratio, verdict critical ≥ 5× / warn ≥ 2×) and per-table hot-shard detection (`hot_shards[]` with a concrete `isolate_tenant_to_new_shard` remediation SQL). This is the primary signal for a skewed distribution key; previously we only reported node-level totals.
+- `citus_connection_capacity`: coordinator-only mode now reports both `recommended_client_max` (hard ceiling assuming every coord backend fans out at the full `max_adaptive_executor_pool_size`) and `sustainable_client_max` (realistic steady-state cap that credits `fanout_concurrency`, default 0.5). Previously the worst-case-only number (e.g. 6 clients on a default 100-connection cluster) made the mode look unusable.
+
 ### Changed
 - **BREAKING**: Default connection mode is now coordinator-only. Worker data is fetched via `run_command_on_workers()` UDF instead of direct connections. This matches production Citus deployments where only the coordinator is exposed.
 - Added `coordinator_only` config flag (default: `true`) to control connection behavior.

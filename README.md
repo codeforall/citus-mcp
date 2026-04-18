@@ -901,7 +901,7 @@ takes no input.
 | `citus_lock_inspector` | `include_locks?`, `limit?` | Lock waits and blockers |
 | `citus_job_inspector` | `state?`, `include_tasks?`, `limit?` | Background-job progress |
 | `citus_shard_heatmap` | `table?`, `metric?`, `group_by?`, `limit?` | Hot-shard map |
-| `citus_shard_skew_report` | `table?`, `metric?`, `include_top_shards?` | Skew analysis |
+| `citus_shard_skew_report` | `table?`, `metric?`, `include_top_shards?` | Skew analysis. Returns per-node summaries (with `only_reference_tables` flag so ref-only nodes like the coordinator are excluded from the cluster skew metric), per-colocation `max/avg` ratios (verdict critical ≥ 5× / warn ≥ 2×), and a `hot_shards[]` list with a ready-to-run `isolate_tenant_to_new_shard` remediation SQL. |
 | `citus_explain_query` | `sql` *(req)*, `analyze?`, `verbose?`, `costs?` | Distributed EXPLAIN |
 | `citus_proactive_health` | `long_tx_seconds?`, `idle_in_tx_seconds?`, `stuck_prepared_xact_seconds?`, `bloat_*?`, `include_workers?` | Long-tx / 2PC / bloat / saturation dashboard |
 
@@ -914,7 +914,7 @@ takes no input.
 | `citus_worker_memcontexts` | `top_n?` | `pg_get_backend_memory_contexts()` fan-out |
 | `citus_partition_growth_simulator` | `partitions_per_parent`, `period_days?` | Projects cache cost of adding partitions |
 | `citus_memory_risk_report` | `node_ram_bytes?`, `node_ram_bytes_by_node?`, `worst_case?`, `warn_pct?`, `crit_pct?`, `include_coordinator?`, `per_backend_app_overhead_bytes?`, `plan_ops_per_query?` | OOM risk rollup per node — 13 consumer terms: shared_buffers, wal_buffers, lock_table (`max_locks_per_transaction × MaxBackends × 270 B`), pred_lock_table, prepared_xact_state, wal_senders, logical_decoding, bgworker_baseline, backend_process_baseline, per_backend_caches (Citus MetadataCache + PG CacheMemoryContext), work_mem_peak (applies `hash_mem_multiplier` + `max_parallel_workers_per_gather` + `plan_ops_per_query`), temp_buffers, autovacuum_budget, plus coord↔worker libpq connection buffers on the coordinator. |
-| `citus_connection_capacity` | `safety_fraction?`, `per_backend_override?`, `include_coordinator?` | Effective client max per deployment mode |
+| `citus_connection_capacity` | `safety_fraction?`, `per_backend_override?`, `include_coordinator?`, `fanout_concurrency?` | Effective client max per deployment mode. Coord-only returns both `recommended_client_max` (hard ceiling assuming every coord backend fans out at the full `max_adaptive_executor_pool_size`) and `sustainable_client_max` (realistic steady-state credit for `fanout_concurrency`, default 0.5). |
 | `citus_connection_fanout_simulator` | `concurrent_clients`, `peer_count?` | Simulates `max_adaptive × peers × clients` pressure |
 | `citus_pooler_advisor` | `expected_clients?`, `mode?` | PgBouncer session vs transaction guidance |
 | `citus_hardware_sizer` | `projected_data_gb?`, `projected_active_clients?`, `projected_iops?`, `retention_days?` | Hardware sizing for current/projected load |
@@ -926,7 +926,7 @@ takes no input.
 |------|------------|-------------|
 | `citus_add_node_preflight` | `host` *(req)*, `port?`, `database?` | Coordinator-side checklist for adding a worker |
 | `citus_node_prepare_advisor` | `host` *(req)*, `port?`, `database?`, `generate_script?` | Preparation steps + optional shell script |
-| `citus_metadata_sync_risk` | `target_max_locks_per_transaction?`, `target_node_ram_gib?`, `assume_sync_mode?` | Estimates `citus_activate_node` work and timeout/OOM/lock risks. Returns `recommended_max_locks_per_transaction` (concrete multiple-of-64 value) when current setting would exhaust the shared lock table, plus the exact `ALTER SYSTEM SET …` statement in `recommendations[]`. |
+| `citus_metadata_sync_risk` | `target_max_locks_per_transaction?`, `target_node_ram_gib?`, `assume_sync_mode?` | Estimates `citus_activate_node` work and timeout/OOM/lock risks. Lock-hash capacity is computed using PostgreSQL's actual `NLOCKENTS` formula: `max_locks_per_transaction × (MaxBackends + max_prepared_transactions)` where `MaxBackends = max_connections + autovacuum_max_workers + max_worker_processes + max_wal_senders`. Both `max_backends` and `lock_table_capacity` are returned under `coordinator_gucs`. Lock-in-tx demand uses `distributed_tables × (1 + avg_indexes_per_table) + distributed_objects + headroom`. Returns `recommended_max_locks_per_transaction` (concrete multiple-of-64 value) when current setting would exhaust the shared lock table, plus the exact `ALTER SYSTEM SET …` statement in `recommendations[]`. |
 | `citus_mx_readiness` | `expected_clients_per_node?`, `target_node_ram_gib?`, `new_node_max_connections?`, `concurrent_queries_per_peer?` | Mesh-connection budgeting before MX |
 | `citus_snapshot_source_advisor` | `strategy?`, `max_candidates?`, `include_simulation?` | Picks best source worker for snapshot-based add |
 

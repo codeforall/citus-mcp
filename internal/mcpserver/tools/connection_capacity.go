@@ -38,6 +38,14 @@ type ConnectionCapacityInput struct {
 	SafetyFraction float64 `json:"safety_fraction,omitempty"`
 	// IncludeCoordinator defaults true.
 	IncludeCoordinator *bool `json:"include_coordinator,omitempty"`
+	// FanoutConcurrency is the fraction of coordinator backends expected to
+	// be simultaneously fanning out to workers with a full adaptive-executor
+	// pool. Default 0.5. Set to 1.0 to get the absolute worst-case number;
+	// set lower (e.g. 0.3) if your workload is mostly single-shard queries
+	// or idle sessions (e.g. large pgbouncer-session fronting).
+	// This ONLY affects the "sustainable" field in coordinator-only mode;
+	// the recommended cap still defaults to the conservative worst case.
+	FanoutConcurrency float64 `json:"fanout_concurrency,omitempty"`
 }
 
 // ConnectionCapacityOutput is the tool response.
@@ -75,6 +83,11 @@ type NodeCapacityReport struct {
 // ModeRecommendation is one deployment-shape answer.
 type ModeRecommendation struct {
 	RecommendedClientMax int      `json:"recommended_client_max"`
+	// SustainableClientMax is a realistic steady-state number that credits
+	// typical workload behavior (e.g. not every client fans out to workers
+	// at the full adaptive-executor pool size at the same instant). Only
+	// populated for coordinator-only mode.
+	SustainableClientMax int      `json:"sustainable_client_max,omitempty"`
 	Bottleneck           string   `json:"bottleneck"`
 	Explanation          string   `json:"explanation"`
 	Warnings             []string `json:"warnings,omitempty"`
@@ -88,6 +101,12 @@ func ConnectionCapacityTool(ctx context.Context, deps Dependencies, in Connectio
 	}
 	if in.SafetyFraction >= 1.0 {
 		return callError(serr.CodeInvalidInput, "safety_fraction must be < 1.0", ""), out, nil
+	}
+	if in.FanoutConcurrency <= 0 {
+		in.FanoutConcurrency = 0.5
+	}
+	if in.FanoutConcurrency > 1.0 {
+		in.FanoutConcurrency = 1.0
 	}
 	includeCoord := true
 	if in.IncludeCoordinator != nil {
@@ -333,18 +352,41 @@ SELECT
 			"Coordinator allows %d backends (%s). Each client spawns up to %d worker connections per query (citus.max_adaptive_executor_pool_size).",
 			capAtCoord, bottleneck, workerFanout,
 		)
-		// Worker shared-pool reverse check.
+		// Worker shared-pool reverse check. The HARD ceiling assumes every
+		// coord backend is simultaneously fanning out at max capacity:
+		//   reverse = min_worker_shared / max_adaptive_executor_pool_size
+		// The SUSTAINABLE number credits the fraction of backends that are
+		// actually fanning out at any instant (fanout_concurrency, default
+		// 0.5 — half the backends are idle / single-shard / cached).
+		sustainable := capAtCoord
 		if minWorkerShared != math.MaxInt && workerFanout > 0 {
 			reverse := minWorkerShared / workerFanout
 			if reverse > 0 && reverse < capAtCoord {
 				capAtCoord = reverse
 				bottleneck = "worker citus.max_shared_pool_size / max_adaptive_executor_pool_size"
-				explain += fmt.Sprintf(" Worst-case fan-out %d × clients must fit under worker citus.max_shared_pool_size=%d -> cap %d.",
+				explain += fmt.Sprintf(
+					" Hard ceiling if every coord backend fans out at the full pool: %d × clients must fit under worker citus.max_shared_pool_size=%d -> cap %d.",
 					workerFanout, minWorkerShared, reverse)
 			}
+			// Sustainable: realistic fan-out concurrency.
+			effFanout := float64(workerFanout) * in.FanoutConcurrency
+			if effFanout < 1.0 {
+				effFanout = 1.0
+			}
+			sust := int(float64(minWorkerShared) / effFanout)
+			if sust > coord.EffectiveMaxClientBackends {
+				sust = coord.EffectiveMaxClientBackends
+			}
+			sustainable = sust
+			explain += fmt.Sprintf(
+				" Sustainable (fanout_concurrency=%.2f): %d concurrent clients assuming %.0f%% fan out at the full pool at once, the rest idle/single-shard/cached.",
+				in.FanoutConcurrency, sust, in.FanoutConcurrency*100)
 		}
 		out.CoordinatorOnly = ModeRecommendation{
-			RecommendedClientMax: capAtCoord, Bottleneck: bottleneck, Explanation: explain,
+			RecommendedClientMax: capAtCoord,
+			SustainableClientMax: sustainable,
+			Bottleneck:           bottleneck,
+			Explanation:          explain,
 		}
 	}
 
