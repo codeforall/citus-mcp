@@ -24,9 +24,10 @@ have — and the load you're planning for.
 | Find stuck 2PC transactions | *"Are there any hung distributed transactions?"* |
 | Check metadata integrity | *"Is every shard actually on disk where Citus thinks it is?"* |
 
-**You don't run SQL. You don't read `pg_catalog`. You ask a question — Citus MCP runs ~30
-specialized diagnostics, correlates the answers, and tells you in plain English
-what's wrong and what to do about it.**
+**You don't run SQL. You don't read `pg_catalog`. You ask a question — Citus MCP runs
+~35 specialized diagnostics (up to ~30 on a typical cluster; tools that can't run
+surface a structured skip reason, never silence), correlates the answers, and tells
+you in plain English what's wrong and what to do about it.**
 
 ---
 
@@ -92,9 +93,11 @@ each of these — with ready-to-run recovery SQL.
 
 > **You:** *"Run a full report."*
 >
-> **MCP tool:** `citus_full_report` — runs ~30 diagnostics, rolls up overall
+> **MCP tool:** `citus_full_report` — runs ~35 diagnostics, rolls up overall
 > health (🟢 healthy / 🟡 warning / 🔴 critical), prioritized findings, and
-> concrete recommendations with exact SQL.
+> concrete recommendations with exact SQL. Tools that can't run on your
+> cluster (e.g. `pg_stat_statements` not installed) surface a structured skip
+> reason — you never get silent coverage gaps.
 
 You get:
 - Every mis-configuration (max_connections, max_locks_per_transaction, wal_level, …)
@@ -165,7 +168,7 @@ Three tools that go deep when something's wrong:
 >
 > Top findings:
 > 1. Node `worker-2` memory pressure: 87% RSS utilization; `citus_memory_risk_report` projects OOM within ~48h at current connection growth rate.
-> 2. Shard skew: tenant `acme_corp` occupies 43% of data on worker-0 vs. 9% average. Consider `SELECT isolate_tenant_to_new_shard('acme_corp')`.
+> 2. Shard skew: colocation group #11 max/avg = 124× — hot shard `public.events:102200` on worker-0. Consider `SELECT isolate_tenant_to_new_shard('public.events', <tenant_value>)`.
 > 3. `max_locks_per_transaction=64` on coordinator — below the recommended ≥256 for your partition count (will block `citus_activate_node`).
 >
 > Exact fixes below (3 SQL snippets).
@@ -180,7 +183,7 @@ Three tools that go deep when something's wrong:
 > (current 200, need 580). Per-backend metadata cache plus PG catalog cache
 > will push per-node RSS to 118 GB (you have 96 GB) → OOM is likely. Three
 > options, ranked:*
-> *  1. Add PgBouncer in transaction mode — effective capacity 6× with zero hardware change.
+> *  1. Add PgBouncer in **transaction mode** — effective capacity 6× with zero hardware change. ⚠️ Requires app to be stateless at the transaction boundary: no session GUCs, no `SET LOCAL` across statements, no prepared statements outside a tx; Citus cached worker connections become useless; 2PC affinity is lost. MCP prints this full caveat list — not just the speedup.
 > *  2. Enable MX — doubles capacity but requires `max_locks_per_transaction ≥ 512`.
 > *  3. Vertical scale to 128 GB RAM per worker — expensive, slowest to deploy.
 
@@ -204,7 +207,7 @@ Three tools that go deep when something's wrong:
 >
 > **Answer:** *3 pre-flight issues:*
 > *  1. `max_locks_per_transaction=64` on new worker → raise to 512 before `citus_add_node` (metadata sync will fail with "out of shared memory").*
-> *  2. `wal_level=replica` → set to `logical` if you'll use logical replication.*
+> *  2. `wal_level=replica` → set to `logical` (required: Citus shard moves and the rebalancer use logical replication by default).*
 > *  3. Projected sync payload ~34 MB / 18 000 metadata objects — allow 2–4 min of elevated coordinator CPU.*
 >
 > *Exact `ALTER SYSTEM SET …` commands below.*
@@ -249,6 +252,24 @@ Three tools that go deep when something's wrong:
 - **Works in coordinator-only mode** — no need to open direct connections
   to every worker; fan-out happens via `run_command_on_workers`.
 
+## 🎯 Precision over volume
+
+- **Every formula cites the Citus/PG source line it's derived from.** See
+  `docs/methodology.md` for per-rule provenance (e.g. `max_replication_slots`
+  is derived from `citus.max_background_task_executors_per_node` +
+  `pg_replication_slots` count + a fixed 2-slot headroom, not a magic number).
+- **Citus product defaults are never flagged as CRITICAL.** A setting that
+  ships enabled by default (e.g. `citus.multi_shard_modify_mode=parallel`)
+  only becomes a finding when combined with a known-dangerous context.
+- **Severity of a finding is separate from the class of the GUC it touches.**
+  A `critical-class` GUC with no drift reports `drifted=false, severity=""`,
+  not `severity=critical`. Counting "critical findings" means what you think
+  it means.
+- **Silent tools are a bug.** When a diagnostic can't run (e.g.
+  `pg_stat_statements` not installed, coordinator unreachable, input
+  missing), it returns a structured `{tool, reason, detail}` in
+  `tools_skipped` — never an empty response.
+
 ---
 
 ## 🏁 Getting started in 2 minutes
@@ -276,8 +297,9 @@ That's it. No SQL. No dashboards. No alphabet-soup of `pg_stat_*` views.
 
 ## 📚 Where to go next
 
-- **Full tool reference:** `README.md` → *Tools Reference* section (71 tools).
+- **Full tool reference:** `README.md` → *Tools Reference* section (64 tools).
 - **Feature list:** `README.md` → *Features*.
+- **Methodology & formula provenance:** `docs/methodology.md`.
 - **How MCP itself works:** <https://modelcontextprotocol.io>.
 - **Feedback / bugs:** open an issue in this repo — feature ideas welcome.
 
