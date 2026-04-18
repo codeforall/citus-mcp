@@ -133,7 +133,8 @@ type FullReportShardsSection struct {
 	ShardSkew     *ShardSkewOutput           `json:"shard_skew,omitempty"`
 	ShardHeatmap  *ShardHeatmapOutput        `json:"shard_heatmap,omitempty"`
 	Colocation    *ColocationInspectorOutput `json:"colocation,omitempty"`
-	RebalanceCost *RebalanceCostOutput       `json:"rebalance_cost,omitempty"`
+	RebalanceCost      *RebalanceCostOutput         `json:"rebalance_cost,omitempty"`
+	RebalanceForensics *RebalanceForensicsOutput    `json:"rebalance_forensics,omitempty"`
 }
 
 type FullReportAdvisorsSection struct {
@@ -465,7 +466,15 @@ func FullReportTool(ctx context.Context, deps Dependencies, in FullReportInput) 
 		sh.RebalanceCost = &o
 		return nil
 	})
-	if sh.ShardSkew != nil || sh.ShardHeatmap != nil || sh.Colocation != nil || sh.RebalanceCost != nil {
+	run("rebalance_forensics", func() error {
+		_, o, err := RebalanceForensicsTool(ctx, deps, RebalanceForensicsInput{})
+		if err != nil {
+			return err
+		}
+		sh.RebalanceForensics = &o
+		return nil
+	})
+	if sh.ShardSkew != nil || sh.ShardHeatmap != nil || sh.Colocation != nil || sh.RebalanceCost != nil || sh.RebalanceForensics != nil {
 		out.Shards = sh
 	}
 
@@ -729,6 +738,20 @@ func buildTopRecommendations(r *FullReportOutput) []string {
 			push(fmt.Sprintf(
 				"2PC recovery needed: %d commit_needed + %d rollback_needed prepared xact(s) (oldest %.0fs). Run SELECT recover_prepared_transactions(); on the coordinator, or consult two_pc_recovery.recovery_script for per-node manual recovery.",
 				t.Summary.CommitNeeded, t.Summary.RollbackNeeded, t.Summary.OldestAgeSeconds))
+		}
+	}
+	// Rebalance forensics — surface stall diagnoses and cleanup backlog.
+	if r.Shards != nil && r.Shards.RebalanceForensics != nil {
+		rf := r.Shards.RebalanceForensics
+		if rf.Stall.Classification != "no_stall" && rf.Stall.Classification != "" && rf.Job != nil {
+			push(fmt.Sprintf(
+				"Rebalance job %d is stalled (%s): %s. See rebalance_forensics.playbook for recovery steps.",
+				rf.Job.JobID, rf.Stall.Classification, rf.Stall.PrimaryReason))
+		}
+		if rf.CleanupPendingCount > 0 && rf.Stall.Classification != "cleanup_backlog" {
+			push(fmt.Sprintf(
+				"pg_dist_cleanup has %d pending record(s); run SELECT citus_cleanup_orphaned_resources(); on coordinator to reclaim orphaned shards left by prior moves.",
+				rf.CleanupPendingCount))
 		}
 	}
 	if r.Alarms != nil {

@@ -114,7 +114,7 @@ You should see a "pong" response confirming the connection works.
 
 ## ✨ Features
 
-69 MCP tools spanning diagnostics, forensics, capacity planning, advisors,
+70 MCP tools spanning diagnostics, forensics, capacity planning, advisors,
 alarms, time-series, and gated execute operations. The single covering tool
 `citus_full_report` runs ~30 read-only diagnostics in one shot and rolls
 up overall health, top findings, and concrete recommendations.
@@ -181,6 +181,7 @@ up overall health, top findings, and concrete recommendations.
 | Tool | Description |
 |------|-------------|
 | `citus_2pc_recovery_inspector` | Fans out `pg_prepared_xacts` to coord + workers, parses Citus GIDs, correlates with `pg_dist_transaction` and `get_all_active_transactions()`, and classifies each as `commit_needed` / `rollback_needed` / `in_flight`. Emits a ready-to-run per-node `COMMIT PREPARED` / `ROLLBACK PREPARED` script + alarms for commit backlog and orphan xacts. Read-only — never issues COMMIT/ROLLBACK itself. |
+| `citus_rebalance_forensics` | Diagnoses **why** a rebalance (or any bg job) is stuck: inspects `pg_dist_background_job/_task`, correlates running tasks with `pg_stat_activity` wait events and `pg_blocking_pids`, counts `pg_dist_cleanup` backlog, and classifies stalls as `blocked_by_ddl` / `blocked_by_lock` / `bg_worker_starvation` / `retry_backoff` / `error_with_retries_exhausted` / `cleanup_backlog` / `finished_with_errors`. Emits a concrete playbook (`citus_rebalance_stop` / `citus_cleanup_orphaned_resources` / `pg_cancel_backend`) plus alarms. Addresses citusdata/citus issues #6681, #7103, #8236, #1210. |
 
 ### 🔧 Metadata, Extensions & Routing
 
@@ -933,6 +934,21 @@ takes no input.
 | Tool | Parameters | Description |
 |------|------------|-------------|
 | `citus_2pc_recovery_inspector` | `in_flight_threshold_seconds?` (default 60), `stuck_orphan_seconds?` (default 600), `include_non_citus?`, `suppress_recovery_script?` | Forensics for stuck 2PC / prepared-transaction state. Fans out `pg_prepared_xacts` across coord + workers, parses Citus GIDs (`citus_<group>_<pid>_<txn>_<conn>`), correlates with `pg_dist_transaction` and `get_all_active_transactions()`, classifies each as `commit_needed` / `rollback_needed` / `in_flight` / `non_citus`, and emits a ready-to-run per-node recovery script. Emits `two_pc.commit_backlog`, `two_pc.orphans` (critical if older than `stuck_orphan_seconds`), `two_pc.slow_in_flight` alarms. Read-only — never issues COMMIT/ROLLBACK itself. |
+| `citus_rebalance_forensics` | `job_id?`, `stall_threshold_seconds?` (default 300), `lookback_hours?` (default 24), `include_finished_tasks?`, `retries_exhausted_threshold?` (default 3), `cleanup_backlog_threshold?` (default 100) | Diagnoses **why** a rebalance or background job is stalled. Reads `pg_dist_background_job/_task/_depend`, correlates running tasks with `pg_stat_activity` wait events and `pg_blocking_pids` (including blocker PIDs + their current queries + lock-mode descriptions), counts `pg_dist_cleanup` backlog, reads `citus.max_background_task_executors`. Classifies stalls as `blocked_by_ddl` / `blocked_by_lock` / `bg_worker_starvation` / `retry_backoff` / `error_with_retries_exhausted` / `cleanup_backlog` / `finished_with_errors` / `no_stall`. Emits a concrete recovery playbook (stop + cleanup + resume SQL) and alarms. |
+
+**Example — `citus_rebalance_forensics`:**
+
+```jsonc
+// Default: find most recent stuck/running job within last 24h
+{}
+
+// Diagnose a specific job, include finished tasks for postmortem
+{"job_id": 42, "include_finished_tasks": true}
+
+// Tighter thresholds: flag retries earlier, warn on smaller cleanup backlogs
+{"retries_exhausted_threshold": 1, "cleanup_backlog_threshold": 10}
+```
+
 
 **Example — `citus_2pc_recovery_inspector`:**
 
@@ -1124,7 +1140,7 @@ citus-mcp/
 ├── cmd/citus-mcp/       # Main entry point
 ├── internal/
 │   ├── mcpserver/       # MCP server implementation
-│   │   ├── tools/       # Tool implementations (68 tools)
+│   │   ├── tools/       # Tool implementations (70 tools)
 │   │   ├── prompts/     # Prompt templates
 │   │   └── resources/   # Static resources
 │   ├── db/              # Database layer and worker management

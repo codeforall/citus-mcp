@@ -429,6 +429,13 @@ func RegisterAll(server *mcp.Server, deps Dependencies) {
 		return TwoPCRecoveryInspectorTool(ctx, deps, input)
 	})
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "citus_rebalance_forensics",
+		Description: "Read-only diagnosis of WHY a Citus rebalance (or any background job) is stuck. Inspects pg_dist_background_job/_task/_depend, correlates running tasks with pg_stat_activity wait events and pg_blocking_pids, counts pg_dist_cleanup backlog, and reads citus.max_background_task_executors. Classifies stalls as blocked_by_ddl | blocked_by_lock | bg_worker_starvation | retry_backoff | error_with_retries_exhausted | cleanup_backlog | finished_with_errors | no_stall, and emits a concrete playbook (citus_rebalance_stop / citus_cleanup_orphaned_resources / pg_cancel_backend) plus alarms. Addresses operational gaps from citusdata/citus issues #6681, #7103, #8236, #1210.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input RebalanceForensicsInput) (*mcp.CallToolResult, RebalanceForensicsOutput, error) {
+		return RebalanceForensicsTool(ctx, deps, input)
+	})
+
 	// ---- M6: covering report ----
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "citus_full_report",
