@@ -133,8 +133,9 @@ type FullReportShardsSection struct {
 	ShardSkew     *ShardSkewOutput           `json:"shard_skew,omitempty"`
 	ShardHeatmap  *ShardHeatmapOutput        `json:"shard_heatmap,omitempty"`
 	Colocation    *ColocationInspectorOutput `json:"colocation,omitempty"`
-	RebalanceCost      *RebalanceCostOutput         `json:"rebalance_cost,omitempty"`
-	RebalanceForensics *RebalanceForensicsOutput    `json:"rebalance_forensics,omitempty"`
+	RebalanceCost       *RebalanceCostOutput         `json:"rebalance_cost,omitempty"`
+	RebalanceForensics  *RebalanceForensicsOutput    `json:"rebalance_forensics,omitempty"`
+	PlacementIntegrity  *PlacementIntegrityOutput    `json:"placement_integrity,omitempty"`
 }
 
 type FullReportAdvisorsSection struct {
@@ -474,7 +475,15 @@ func FullReportTool(ctx context.Context, deps Dependencies, in FullReportInput) 
 		sh.RebalanceForensics = &o
 		return nil
 	})
-	if sh.ShardSkew != nil || sh.ShardHeatmap != nil || sh.Colocation != nil || sh.RebalanceCost != nil || sh.RebalanceForensics != nil {
+	run("placement_integrity_check", func() error {
+		_, o, err := PlacementIntegrityCheckTool(ctx, deps, PlacementIntegrityInput{})
+		if err != nil {
+			return err
+		}
+		sh.PlacementIntegrity = &o
+		return nil
+	})
+	if sh.ShardSkew != nil || sh.ShardHeatmap != nil || sh.Colocation != nil || sh.RebalanceCost != nil || sh.RebalanceForensics != nil || sh.PlacementIntegrity != nil {
 		out.Shards = sh
 	}
 
@@ -752,6 +761,26 @@ func buildTopRecommendations(r *FullReportOutput) []string {
 			push(fmt.Sprintf(
 				"pg_dist_cleanup has %d pending record(s); run SELECT citus_cleanup_orphaned_resources(); on coordinator to reclaim orphaned shards left by prior moves.",
 				rf.CleanupPendingCount))
+		}
+	}
+	// Placement integrity — ghost/orphan placements.
+	if r.Shards != nil && r.Shards.PlacementIntegrity != nil {
+		pi := r.Shards.PlacementIntegrity
+		if len(pi.GhostPlacements) > 0 {
+			push(fmt.Sprintf(
+				"CRITICAL: %d ghost placement(s) — metadata references shards missing on disk (reads will error). Use citus_copy_shard_placement from a healthy replica; see placement_integrity.playbook.",
+				len(pi.GhostPlacements)))
+		}
+		if len(pi.OrphanTables) > 0 {
+			unqueued := 0
+			for _, o := range pi.OrphanTables {
+				if !o.InCleanupList {
+					unqueued++
+				}
+			}
+			push(fmt.Sprintf(
+				"%d orphan shard table(s) on workers with no placement metadata (%d not queued). Run SELECT citus_cleanup_orphaned_resources(); to drop queued orphans.",
+				len(pi.OrphanTables), unqueued))
 		}
 	}
 	if r.Alarms != nil {

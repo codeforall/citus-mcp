@@ -436,6 +436,13 @@ func RegisterAll(server *mcp.Server, deps Dependencies) {
 		return RebalanceForensicsTool(ctx, deps, input)
 	})
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "citus_placement_integrity_check",
+		Description: "Three-way cross-check between Citus metadata (pg_dist_placement + pg_dist_shard + pg_dist_node), on-disk reality on every worker (pg_class via run_command_on_workers), and pg_dist_cleanup. Detects ghost placements (metadata says shard exists but no relation on disk — reads will error), orphan tables (shard-suffix tables on worker with no placement row — leaked by failed rebalances/moves), inactive_with_data (shardstate != 1 but data still materialised — reclaimable), size drift (pg_relation_size vs placement.shardlength), and pg_dist_cleanup backlog. Emits a per-class reconciliation playbook (citus_copy_shard_placement / citus_cleanup_orphaned_resources / citus_update_shard_statistics). Read-only; never drops or copies anything itself. Addresses citusdata/citus issues #8236, #5284, #5286, #4977, #5133.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input PlacementIntegrityInput) (*mcp.CallToolResult, PlacementIntegrityOutput, error) {
+		return PlacementIntegrityCheckTool(ctx, deps, input)
+	})
+
 	// ---- M6: covering report ----
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "citus_full_report",

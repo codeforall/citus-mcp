@@ -114,7 +114,7 @@ You should see a "pong" response confirming the connection works.
 
 ## ✨ Features
 
-70 MCP tools spanning diagnostics, forensics, capacity planning, advisors,
+71 MCP tools spanning diagnostics, forensics, capacity planning, advisors,
 alarms, time-series, and gated execute operations. The single covering tool
 `citus_full_report` runs ~30 read-only diagnostics in one shot and rolls
 up overall health, top findings, and concrete recommendations.
@@ -182,6 +182,7 @@ up overall health, top findings, and concrete recommendations.
 |------|-------------|
 | `citus_2pc_recovery_inspector` | Fans out `pg_prepared_xacts` to coord + workers, parses Citus GIDs, correlates with `pg_dist_transaction` and `get_all_active_transactions()`, and classifies each as `commit_needed` / `rollback_needed` / `in_flight`. Emits a ready-to-run per-node `COMMIT PREPARED` / `ROLLBACK PREPARED` script + alarms for commit backlog and orphan xacts. Read-only — never issues COMMIT/ROLLBACK itself. |
 | `citus_rebalance_forensics` | Diagnoses **why** a rebalance (or any bg job) is stuck: inspects `pg_dist_background_job/_task`, correlates running tasks with `pg_stat_activity` wait events and `pg_blocking_pids`, counts `pg_dist_cleanup` backlog, and classifies stalls as `blocked_by_ddl` / `blocked_by_lock` / `bg_worker_starvation` / `retry_backoff` / `error_with_retries_exhausted` / `cleanup_backlog` / `finished_with_errors`. Emits a concrete playbook (`citus_rebalance_stop` / `citus_cleanup_orphaned_resources` / `pg_cancel_backend`) plus alarms. Addresses citusdata/citus issues #6681, #7103, #8236, #1210. |
+| `citus_placement_integrity_check` | Three-way cross-check between Citus metadata (`pg_dist_placement`), on-disk reality on workers (`pg_class` via `run_command_on_workers`, with the Citus shard-visibility hook disabled), and `pg_dist_cleanup`. Detects ghost placements (metadata references shards missing on disk — reads error), orphan tables (shard-suffix tables on workers with no placement row), inactive-with-data (shardstate != 1 but data still materialised), and size drift. Filters partition children and user tables via distributed-table base-name matching. Emits a per-class reconciliation playbook (`citus_copy_shard_placement` / `citus_cleanup_orphaned_resources` / `citus_update_shard_statistics`). |
 
 ### 🔧 Metadata, Extensions & Routing
 
@@ -949,6 +950,21 @@ takes no input.
 {"retries_exhausted_threshold": 1, "cleanup_backlog_threshold": 10}
 ```
 
+| `citus_placement_integrity_check` | `schemas?` (default `["public"]`), `skip_size_drift?`, `size_drift_factor?` (default 2.0), `max_rows_per_class?` (default 200), `check_inactive_placements?` (default true) | Three-way cross-check between Citus metadata (`pg_dist_placement` × `pg_dist_shard` × `pg_dist_node`), on-disk reality on every worker (`pg_class` scan via `run_command_on_workers` with the Citus shard-visibility hook disabled), and `pg_dist_cleanup`. Detects: (a) ghost placements — metadata references shards missing on disk (reads WILL error); (b) orphan tables — shard-suffix tables on workers with no placement row (flagged whether or not queued in `pg_dist_cleanup`); (c) inactive-with-data — `shardstate != 1` but data still materialised; (d) size drift — `pg_relation_size` vs `placement.shardlength` deviates > `size_drift_factor`. Filters out partition children and user tables whose names accidentally end in `_<digits>` by matching base name against known distributed-table regclass names. Emits a per-class reconciliation playbook (`citus_copy_shard_placement` / `citus_cleanup_orphaned_resources` / `citus_update_shard_statistics`). Read-only. |
+
+**Example — `citus_placement_integrity_check`:**
+
+```jsonc
+// Default — scan public schema, detect all 4 classes
+{}
+
+// Multi-schema, skip size drift for speed
+{"schemas": ["public", "tenants"], "skip_size_drift": true}
+
+// Strict size drift (flag any > 1.5× deviation)
+{"size_drift_factor": 1.5}
+```
+
 
 **Example — `citus_2pc_recovery_inspector`:**
 
@@ -1140,7 +1156,7 @@ citus-mcp/
 ├── cmd/citus-mcp/       # Main entry point
 ├── internal/
 │   ├── mcpserver/       # MCP server implementation
-│   │   ├── tools/       # Tool implementations (70 tools)
+│   │   ├── tools/       # Tool implementations (71 tools)
 │   │   ├── prompts/     # Prompt templates
 │   │   └── resources/   # Static resources
 │   ├── db/              # Database layer and worker management
