@@ -126,10 +126,13 @@ type CleanupRecord struct {
 type PlacementIntegrityOutput struct {
 	PlacementsChecked  int                `json:"placements_checked"`
 	WorkersChecked     int                `json:"workers_checked"`
+	SkippedWorkers     []SkippedWorker    `json:"skipped_workers"`
+	PartialResults     bool               `json:"partial_results"` // true iff at least one worker fanout failed
 	GhostPlacements    []GhostPlacement   `json:"ghost_placements"`
 	OrphanTables       []OrphanTable      `json:"orphan_tables"`
 	InactiveWithData   []InactiveWithData `json:"inactive_with_data"`
 	SizeDrifts         []SizeDrift        `json:"size_drifts"`
+	StaleStats         []SizeDrift        `json:"stale_stats"` // metadata shardlength=0 but bytes>0
 	CleanupRecords     []CleanupRecord    `json:"cleanup_records"`
 	Truncated          map[string]bool    `json:"truncated"` // per-class truncation flag
 	Summary            string             `json:"summary"`
@@ -137,6 +140,12 @@ type PlacementIntegrityOutput struct {
 	Recommendations    []string           `json:"recommendations"`
 	Alarms             []diagnostics.Alarm `json:"alarms"`
 	OverallStatus      string             `json:"overall_status"` // ok | warning | critical
+}
+
+type SkippedWorker struct {
+	NodeName string `json:"node_name"`
+	NodePort int32  `json:"node_port"`
+	Error    string `json:"error"`
 }
 
 var shardSuffixRE = regexp.MustCompile(`_(\d+)$`)
@@ -161,10 +170,12 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 	}
 
 	out := PlacementIntegrityOutput{
+		SkippedWorkers:   []SkippedWorker{},
 		GhostPlacements:  []GhostPlacement{},
 		OrphanTables:     []OrphanTable{},
 		InactiveWithData: []InactiveWithData{},
 		SizeDrifts:       []SizeDrift{},
+		StaleStats:       []SizeDrift{},
 		CleanupRecords:   []CleanupRecord{},
 		Truncated:        map[string]bool{},
 		Playbook:         []string{},
@@ -193,12 +204,12 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 	expectedByKey := map[string]*expected{}
 	// Also keyed by shardid per node to detect inactive-with-data.
 	expectedByShardNode := map[string]*expected{}
-	// Set of qualified distributed-table base names (e.g. "public.events").
-	// Used to recognise which `<base>_<shardid>` relations on a worker are
-	// genuine Citus shards vs. unrelated tables that happen to end in _<digits>
-	// (common examples: month-partition tables like orders_2026_04 or
-	// user-owned tables like log_2024).
-	validBaseNames := map[string]bool{}
+	// Set of (lowercased base name | shardid) pairs that metadata knows
+	// about. An on-disk `<base>_<shardid>` relation is only a Citus-shard
+	// candidate if this pair exists — otherwise it's a user table whose
+	// name happens to match `<distributed-table-base>_<digits>` (e.g.
+	// an events_123456 table where 123456 isn't a real shardid).
+	validBasePairs := map[string]bool{}
 
 	rows, err := deps.Pool.Query(ctx, `
 		SELECT p.placementid, p.shardid, p.groupid, p.shardstate::int,
@@ -231,7 +242,7 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 		ek := e
 		expectedByKey[placementKey(e.nodeName, e.nodePort, e.relation, e.shardID)] = &ek
 		expectedByShardNode[fmt.Sprintf("%s:%d|%d", e.nodeName, e.nodePort, e.shardID)] = &ek
-		validBaseNames[strings.ToLower(e.relation)] = true
+		validBasePairs[fmt.Sprintf("%s|%d", strings.ToLower(e.relation), e.shardID)] = true
 	}
 
 	// -------- 2. Fan out to workers: enumerate shard-suffix relations with sizes.
@@ -266,8 +277,18 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 		bytes   int64
 	}{}
 
+	// Track workers whose fanout failed — we must NOT classify any
+	// placement on those nodes as ghost (the on-disk truth is unknown).
+	skippedNodes := map[string]bool{} // key = "nodename:port"
+
 	for _, wr := range workerResults {
 		if !wr.Success {
+			nodeKey := fmt.Sprintf("%s:%d", wr.NodeName, wr.NodePort)
+			skippedNodes[nodeKey] = true
+			out.SkippedWorkers = append(out.SkippedWorkers, SkippedWorker{
+				NodeName: wr.NodeName, NodePort: wr.NodePort, Error: wr.Error,
+			})
+			out.PartialResults = true
 			continue
 		}
 		for _, row := range wr.Rows {
@@ -284,10 +305,12 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 			}
 			baseName := strings.TrimSuffix(relname, "_"+m[1])
 			qualified := fmt.Sprintf("%s.%s", schema, baseName)
-			// Only treat this as a Citus shard if its base name matches a
-			// known distributed table. Otherwise it's unrelated (partition
-			// children of non-Citus tables, user tables ending in digits).
-			if !validBaseNames[strings.ToLower(qualified)] {
+			// A relation is a genuine Citus shard only if BOTH the base
+			// name matches a known distributed table AND the (base,
+			// shardid) pair exists in metadata. The pair check rules out
+			// user tables like `events_123456` where 123456 isn't a real
+			// shard id.
+			if !validBasePairs[fmt.Sprintf("%s|%d", strings.ToLower(qualified), shardID)] {
 				continue
 			}
 			key := placementKey(wr.NodeName, wr.NodePort, qualified, shardID)
@@ -330,6 +353,12 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 		if e.shardState != 1 {
 			// Not active — treated separately (inactive_with_data covers the
 			// other direction). No ghost alert for intentionally inactive rows.
+			continue
+		}
+		// If the worker's fanout failed we don't actually know whether the
+		// shard relation is on-disk or not — treating it as a ghost would
+		// trigger one false-positive per placement on that node.
+		if skippedNodes[fmt.Sprintf("%s:%d", e.nodeName, e.nodePort)] {
 			continue
 		}
 		baseName := e.relation
@@ -411,6 +440,27 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 			if !ok {
 				continue
 			}
+			// Special-case the stale-stats pattern: metadata shardlength=0
+			// (never populated or stale after citus_update_shard_statistics
+			// was skipped) but disk has real bytes. Surface it separately
+			// instead of suppressing — this is the most common "why is my
+			// rebalancer making bad decisions?" signal.
+			if e.shardLen == 0 && a.bytes > 0 {
+				out.StaleStats = append(out.StaleStats, SizeDrift{
+					PlacementID:  e.placementID,
+					ShardID:      e.shardID,
+					NodeName:     e.nodeName,
+					NodePort:     e.nodePort,
+					Relation:     a.schema + "." + a.relname,
+					MetadataSize: 0,
+					ActualSize:   a.bytes,
+					DriftRatio:   0, // undefined; metadata=0
+				})
+				if len(out.StaleStats) >= in.MaxRowsPerClass {
+					out.Truncated["stale_stats"] = true
+				}
+				continue
+			}
 			if e.shardLen == 0 || a.bytes == 0 {
 				continue
 			}
@@ -438,12 +488,44 @@ func PlacementIntegrityCheckTool(ctx context.Context, deps Dependencies, in Plac
 	}
 
 	// -------- 8. Summary + classification + alarms.
-	out.Summary = fmt.Sprintf(
-		"Checked %d placement(s) across %d worker(s): %d ghost, %d orphan, %d inactive-with-data, %d size-drift, %d pending cleanup record(s).",
+	summaryParts := fmt.Sprintf(
+		"Checked %d placement(s) across %d worker(s): %d ghost, %d orphan, %d inactive-with-data, %d size-drift, %d stale-stats, %d pending cleanup record(s).",
 		out.PlacementsChecked, out.WorkersChecked,
 		len(out.GhostPlacements), len(out.OrphanTables),
 		len(out.InactiveWithData), len(out.SizeDrifts),
-		len(out.CleanupRecords))
+		len(out.StaleStats), len(out.CleanupRecords))
+	if out.PartialResults {
+		summaryParts += fmt.Sprintf(" PARTIAL RESULTS: %d worker(s) unreachable — ghost/orphan detection skipped for those nodes.", len(out.SkippedWorkers))
+	}
+	out.Summary = summaryParts
+
+	if out.PartialResults {
+		a := deps.Alarms.Emit(diagnostics.Alarm{
+			Kind: "placement.partial_results", Severity: diagnostics.SeverityWarning,
+			Source:  "citus_placement_integrity_check",
+			Message: fmt.Sprintf("%d worker(s) unreachable via fanout; results are incomplete", len(out.SkippedWorkers)),
+			Evidence: map[string]any{"skipped_workers": out.SkippedWorkers},
+			FixHint:  "Verify all workers are reachable (citus_check_cluster_node_health()) and re-run this tool.",
+		})
+		out.Alarms = append(out.Alarms, *a)
+		if out.OverallStatus == "ok" {
+			out.OverallStatus = "warning"
+		}
+	}
+
+	if len(out.StaleStats) > 0 {
+		a := deps.Alarms.Emit(diagnostics.Alarm{
+			Kind: "placement.stale_stats", Severity: diagnostics.SeverityWarning,
+			Source:  "citus_placement_integrity_check",
+			Message: fmt.Sprintf("%d placement(s) have shardlength=0 in metadata but data on disk — rebalancer decisions will be wrong", len(out.StaleStats)),
+			Evidence: map[string]any{"count": len(out.StaleStats)},
+			FixHint:  "SELECT citus_update_shard_statistics(shardid) for each affected shard, or SELECT citus_update_table_statistics(logicalrelid) per table.",
+		})
+		out.Alarms = append(out.Alarms, *a)
+		if out.OverallStatus == "ok" {
+			out.OverallStatus = "warning"
+		}
+	}
 
 	if len(out.GhostPlacements) > 0 {
 		a := deps.Alarms.Emit(diagnostics.Alarm{

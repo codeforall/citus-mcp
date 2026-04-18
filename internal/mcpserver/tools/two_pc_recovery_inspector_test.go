@@ -61,6 +61,31 @@ func TestParseCitusGID(t *testing.T) {
 			wantTxnNum:  18446744073709551000,
 			wantConnNum: 0,
 		},
+		{
+			name:   "too many parts (5)",
+			gid:    "citus_1_2_3_4_5",
+			wantOK: false,
+		},
+		{
+			name:   "four parts with unparseable conn",
+			gid:    "citus_1_2_3_bad",
+			wantOK: false,
+		},
+		{
+			name:   "negative group",
+			gid:    "citus_-1_100_200_3",
+			wantOK: false,
+		},
+		{
+			name:   "negative pid",
+			gid:    "citus_0_-100_200_3",
+			wantOK: false,
+		},
+		{
+			name:   "two parts (no txn)",
+			gid:    "citus_0_100",
+			wantOK: false,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -127,6 +152,22 @@ func TestBuildRecoveryScriptGrouping(t *testing.T) {
 	}
 	if contains(script, "in_flight") {
 		t.Errorf("script should not include in_flight entries")
+	}
+}
+
+func TestBuildRecoveryScriptNoTransactionBlock(t *testing.T) {
+	// COMMIT PREPARED / ROLLBACK PREPARED cannot run inside BEGIN/COMMIT.
+	// Regression: the script must be a sequence of standalone top-level
+	// statements, never wrapped in a transaction block.
+	rows := []PreparedXactRow{
+		{Node: "worker1:5433", Classification: "commit_needed", RecommendedSQL: "COMMIT PREPARED 'g1';", AgeSeconds: 30},
+		{Node: "worker1:5433", Classification: "rollback_needed", RecommendedSQL: "ROLLBACK PREPARED 'g2';", AgeSeconds: 90},
+	}
+	script := buildRecoveryScript(rows)
+	for _, forbidden := range []string{"BEGIN;", "BEGIN\n", "COMMIT;", "COMMIT\n"} {
+		if contains(script, forbidden) {
+			t.Errorf("script must not contain %q (PostgreSQL rejects COMMIT/ROLLBACK PREPARED inside a tx block)\nscript:\n%s", forbidden, script)
+		}
 	}
 }
 

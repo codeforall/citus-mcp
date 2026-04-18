@@ -89,6 +89,7 @@ type RebalanceTaskDetail struct {
 	PID            *int32  `json:"pid,omitempty"`
 	RetryCount     int     `json:"retry_count"`
 	NotBefore      *string `json:"not_before,omitempty"`
+	InBackoff      bool    `json:"in_backoff,omitempty"` // true iff not_before > now(); ready-to-run otherwise
 	Message        string  `json:"message,omitempty"`
 	Command        string  `json:"command,omitempty"`
 	AgeSeconds     float64 `json:"age_seconds,omitempty"`
@@ -98,7 +99,8 @@ type RebalanceTaskDetail struct {
 	WaitEvent      string  `json:"wait_event,omitempty"`
 	BlockerPIDs    []int32 `json:"blocker_pids,omitempty"`
 	BlockerQueries []string `json:"blocker_queries,omitempty"`
-	BlockerAccess  string  `json:"blocker_access,omitempty"` // e.g. "AccessExclusiveLock on public.t"
+	BlockerLockModes []string `json:"blocker_lock_modes,omitempty"` // strongest granted lock held by each blocker
+	BlockerAccess  string  `json:"blocker_access,omitempty"` // e.g. "AccessExclusiveLock on public.t" (waiter's request)
 	// Summary classification for *this* task.
 	TaskClassification string `json:"task_classification,omitempty"`
 }
@@ -196,6 +198,7 @@ func RebalanceForensicsTool(ctx context.Context, deps Dependencies, in Rebalance
 			SELECT task_id, status::text, pid,
 			       COALESCE(retry_count, 0),
 			       to_char(not_before AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+			       (not_before IS NOT NULL AND not_before > now()) AS in_backoff,
 			       COALESCE(message, ''),
 			       left(COALESCE(command, ''), 4000)
 			FROM pg_catalog.pg_dist_background_task
@@ -207,11 +210,13 @@ func RebalanceForensicsTool(ctx context.Context, deps Dependencies, in Rebalance
 				var td RebalanceTaskDetail
 				var pidV *int32
 				var notBefore *string
-				if err := rows.Scan(&td.TaskID, &td.Status, &pidV, &td.RetryCount, &notBefore, &td.Message, &td.Command); err != nil {
+				var inBackoff bool
+				if err := rows.Scan(&td.TaskID, &td.Status, &pidV, &td.RetryCount, &notBefore, &inBackoff, &td.Message, &td.Command); err != nil {
 					continue
 				}
 				td.PID = pidV
 				td.NotBefore = notBefore
+				td.InBackoff = inBackoff
 				out.TaskCounts.Total++
 				switch td.Status {
 				case "blocked":
@@ -270,18 +275,34 @@ func RebalanceForensicsTool(ctx context.Context, deps Dependencies, in Rebalance
 		// If on a lock, get blockers + their current queries.
 		if td.WaitEventType == "Lock" {
 			blkRows, err := deps.Pool.Query(ctx, `
-				SELECT bp.pid, COALESCE(left(bsa.query, 2000), '')
+				SELECT bp.pid,
+				       COALESCE(left(bsa.query, 2000), ''),
+				       COALESCE((
+				         SELECT mode FROM pg_catalog.pg_locks
+				          WHERE pid = bp.pid AND granted
+				          ORDER BY CASE mode
+				            WHEN 'AccessExclusiveLock' THEN 1
+				            WHEN 'ExclusiveLock' THEN 2
+				            WHEN 'ShareRowExclusiveLock' THEN 3
+				            WHEN 'ShareLock' THEN 4
+				            WHEN 'ShareUpdateExclusiveLock' THEN 5
+				            WHEN 'RowExclusiveLock' THEN 6
+				            ELSE 99
+				          END
+				          LIMIT 1), '')
 				FROM unnest(pg_catalog.pg_blocking_pids($1)) AS bp(pid)
 				LEFT JOIN pg_catalog.pg_stat_activity bsa ON bsa.pid = bp.pid`, *td.PID)
 			if err == nil {
 				for blkRows.Next() {
 					var blkPID int32
 					var blkQuery string
-					if err := blkRows.Scan(&blkPID, &blkQuery); err != nil {
+					var blkMode string
+					if err := blkRows.Scan(&blkPID, &blkQuery, &blkMode); err != nil {
 						continue
 					}
 					td.BlockerPIDs = append(td.BlockerPIDs, blkPID)
 					td.BlockerQueries = append(td.BlockerQueries, blkQuery)
+					td.BlockerLockModes = append(td.BlockerLockModes, blkMode)
 				}
 				blkRows.Close()
 			}
@@ -299,7 +320,7 @@ func RebalanceForensicsTool(ctx context.Context, deps Dependencies, in Rebalance
 		// Per-task classification.
 		if td.AgeSeconds > float64(in.StallThresholdSeconds) {
 			if len(td.BlockerPIDs) > 0 {
-				if strings.Contains(td.BlockerAccess, "AccessExclusive") {
+				if blockerIsDDL(td.BlockerQueries, td.BlockerLockModes) {
 					td.TaskClassification = "blocked_by_ddl"
 				} else {
 					td.TaskClassification = "blocked_by_lock"
@@ -354,10 +375,13 @@ func RebalanceForensicsTool(ctx context.Context, deps Dependencies, in Rebalance
 	// and fewer executors than runnable tasks.
 	if primary == "" && out.TaskCounts.Runnable > 0 && out.TaskCounts.Running == 0 &&
 		out.Job != nil && (out.Job.State == "running" || out.Job.State == "scheduled") {
-		// Check if all runnables are in not_before backoff.
+		// Check if all runnables are in not_before backoff (not ready yet).
+		// A runnable is *ready* iff not_before IS NULL OR not_before <= now()
+		// (see Citus metadata_utility.c:2616, 3573). We compute in_backoff
+		// via SQL (using server time) to avoid clock skew.
 		allBackoff := true
 		for _, td := range out.TaskDetails {
-			if td.Status == "runnable" && td.NotBefore == nil {
+			if td.Status == "runnable" && !td.InBackoff {
 				allBackoff = false
 				break
 			}
@@ -395,7 +419,18 @@ func RebalanceForensicsTool(ctx context.Context, deps Dependencies, in Rebalance
 		}
 	}
 
-	// Priority 4: cleanup backlog.
+	// Priority 4: job finished but with errors. Check this BEFORE cleanup
+	// backlog so a failed job that also has cleanup residue is classified
+	// correctly (a failed rebalance commonly leaves orphaned shards).
+	if primary == "" && out.Job != nil &&
+		(out.Job.State == "failed" || out.Job.State == "failing") {
+		primary = "finished_with_errors"
+		reasons = append(reasons, fmt.Sprintf(
+			"job is in state=%s with %d errored task(s)", out.Job.State, out.TaskCounts.Error))
+	}
+
+	// Priority 5: cleanup backlog (always surfaced as a contributing cause,
+	// but only promoted to primary if nothing higher-priority applies).
 	if out.CleanupPendingCount > in.CleanupBacklogThreshold {
 		if primary == "" {
 			primary = "cleanup_backlog"
@@ -403,14 +438,6 @@ func RebalanceForensicsTool(ctx context.Context, deps Dependencies, in Rebalance
 		reasons = append(reasons, fmt.Sprintf(
 			"%d pending pg_dist_cleanup records (> %d threshold); prior moves left residue that requires SELECT citus_cleanup_orphaned_resources();",
 			out.CleanupPendingCount, in.CleanupBacklogThreshold))
-	}
-
-	// Priority 5: job finished but with errors.
-	if primary == "" && out.Job != nil &&
-		(out.Job.State == "failed" || out.Job.State == "failing") {
-		primary = "finished_with_errors"
-		reasons = append(reasons, fmt.Sprintf(
-			"job is in state=%s with %d errored task(s)", out.Job.State, out.TaskCounts.Error))
 	}
 
 	if primary == "" {
@@ -573,4 +600,29 @@ func truncateMsg(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// blockerIsDDL returns true if any blocker is running a DDL statement or
+// already holds an AccessExclusiveLock/ExclusiveLock. We must inspect the
+// *blocker's* state, not the waiter's requested lock — a plain UPDATE can
+// easily block an AccessExclusive request without itself being DDL.
+func blockerIsDDL(queries, modes []string) bool {
+ddlPrefixes := []string{
+"alter ", "drop ", "create ", "truncate ", "reindex ",
+"vacuum full", "cluster ", "refresh materialized",
+}
+for i := range queries {
+q := strings.ToLower(strings.TrimSpace(queries[i]))
+for _, p := range ddlPrefixes {
+if strings.HasPrefix(q, p) {
+return true
+}
+}
+if i < len(modes) {
+if modes[i] == "AccessExclusiveLock" || modes[i] == "ExclusiveLock" {
+return true
+}
+}
+}
+return false
 }

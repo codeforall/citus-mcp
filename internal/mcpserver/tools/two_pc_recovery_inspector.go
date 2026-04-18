@@ -64,7 +64,7 @@ type PreparedXactRow struct {
 	AgeSeconds         float64 `json:"age_seconds"`
 	InDistTransaction  bool    `json:"in_dist_transaction"`
 	StillActive        bool    `json:"still_active"`
-	Classification     string  `json:"classification"` // commit_needed | rollback_needed | in_flight | non_citus | unknown
+	Classification     string  `json:"classification"` // commit_needed | rollback_needed | in_flight | foreign_initiator | non_citus | unknown
 	RecommendedSQL     string  `json:"recommended_sql,omitempty"`
 	Notes              string  `json:"notes,omitempty"`
 }
@@ -81,6 +81,7 @@ type TwoPCSummary struct {
 	CommitNeeded            int     `json:"commit_needed"`
 	RollbackNeeded          int     `json:"rollback_needed"`
 	InFlight                int     `json:"in_flight"`
+	ForeignInitiator        int     `json:"foreign_initiator"`
 	NonCitus                int     `json:"non_citus"`
 	OldestAgeSeconds        float64 `json:"oldest_age_seconds"`
 	DistTransactionEntries  int     `json:"dist_transaction_entries"`
@@ -156,17 +157,18 @@ func TwoPCRecoveryInspectorTool(ctx context.Context, deps Dependencies, in TwoPC
 
 	// -------- 2. pg_dist_transaction (which GIDs the coordinator has committed
 	// and expects each worker group to COMMIT PREPARED).
-	distTxnSet := map[string]bool{} // key = "groupid|gid"
-	distTxnByGID := map[string]int32{}
+	distTxnSet := map[string]bool{}         // key = "groupid|gid"
+	distTxnByKey := map[string]UntrackedDistTxn{} // key = "groupid|gid"
 	{
 		rows, err := deps.Pool.Query(ctx, `SELECT groupid, gid FROM pg_catalog.pg_dist_transaction`)
 		if err == nil {
 			for rows.Next() {
-				var gid int32
+				var groupid int32
 				var name string
-				if rows.Scan(&gid, &name) == nil {
-					distTxnSet[fmt.Sprintf("%d|%s", gid, name)] = true
-					distTxnByGID[name] = gid
+				if rows.Scan(&groupid, &name) == nil {
+					k := fmt.Sprintf("%d|%s", groupid, name)
+					distTxnSet[k] = true
+					distTxnByKey[k] = UntrackedDistTxn{GroupID: groupid, GID: name}
 					out.Summary.DistTransactionEntries++
 				}
 			}
@@ -259,10 +261,9 @@ func TwoPCRecoveryInspectorTool(ctx context.Context, deps Dependencies, in TwoPC
 	}
 
 	// -------- 5. Classify + compute recommended SQL.
-	inFlightSeenGIDs := map[string]bool{} // gids we've seen and classified
+	seenDistTxnKeys := map[string]bool{} // (groupid, gid) pairs we've matched
 	for i := range out.Prepared {
 		r := &out.Prepared[i]
-		inFlightSeenGIDs[r.GID] = true
 
 		gidKey := fmt.Sprintf("%d|%s", r.NodeGroupID, r.GID)
 		ok, parsed := parseCitusGID(r.GID)
@@ -275,12 +276,27 @@ func TwoPCRecoveryInspectorTool(ctx context.Context, deps Dependencies, in TwoPC
 		}
 
 		r.InDistTransaction = distTxnSet[gidKey]
+		if r.InDistTransaction {
+			seenDistTxnKeys[gidKey] = true
+		}
 		r.StillActive = ok && activeTxnNums[r.TransactionNumber]
+
+		// Foreign-initiator check: Citus's RecoverWorkerTransactions
+		// (transaction_recovery.c:516-526) filters prepared xacts with
+		// LIKE 'citus_<localGroupId>_%'. So the coordinator should only
+		// act on 2PCs it initiated (parsed.groupID == coordGroupID).
+		// Worker-initiated 2PCs are recovered by that worker's own
+		// maintenance daemon — we must not suggest COMMIT/ROLLBACK here.
+		foreign := ok && parsed.groupID != coordGroupID
 
 		switch {
 		case !r.IsCitusGID:
 			r.Classification = "non_citus"
 			r.Notes = "GID does not match citus_<group>_<pid>_<txn>_<conn> — not managed by Citus recovery"
+		case foreign:
+			r.Classification = "foreign_initiator"
+			r.Notes = fmt.Sprintf("initiator group %d is not the coordinator (group %d). This 2PC is recovered by that worker's own maintenance daemon; no action from the coordinator.",
+				parsed.groupID, coordGroupID)
 		case r.InDistTransaction:
 			r.Classification = "commit_needed"
 			r.RecommendedSQL = fmt.Sprintf("COMMIT PREPARED %s;", sqlQuote(r.GID))
@@ -327,6 +343,8 @@ func TwoPCRecoveryInspectorTool(ctx context.Context, deps Dependencies, in TwoPC
 			out.Summary.RollbackNeeded++
 		case "in_flight":
 			out.Summary.InFlight++
+		case "foreign_initiator":
+			out.Summary.ForeignInitiator++
 		case "non_citus":
 			out.Summary.NonCitus++
 		}
@@ -334,11 +352,11 @@ func TwoPCRecoveryInspectorTool(ctx context.Context, deps Dependencies, in TwoPC
 
 	// Untracked pg_dist_transaction entries (coord thinks needs commit, but
 	// no prepared xact exists anywhere).
-	for gid, groupID := range distTxnByGID {
-		if !inFlightSeenGIDs[gid] {
+	for k, e := range distTxnByKey {
+		if !seenDistTxnKeys[k] {
 			out.UntrackedDistTransactions = append(out.UntrackedDistTransactions, UntrackedDistTxn{
-				GroupID: groupID,
-				GID:     gid,
+				GroupID: e.GroupID,
+				GID:     e.GID,
 				Note:    "pg_dist_transaction has this entry but no matching prepared xact — already recovered, or worker unreachable",
 			})
 		}
@@ -461,15 +479,18 @@ func parseCitusGID(gid string) (bool, parsedGID) {
 		return false, p
 	}
 	parts := strings.Split(gid[len("citus_"):], "_")
-	if len(parts) < 3 {
+	// Valid shapes are exactly 3 or 4 parts (conn optional for older/
+	// worker-issued GIDs). Reject everything else to avoid treating
+	// arbitrary "citus_foo_bar_baz_…" strings as citus-managed.
+	if len(parts) != 3 && len(parts) != 4 {
 		return false, p
 	}
 	g64, err := strconv.ParseInt(parts[0], 10, 32)
-	if err != nil {
+	if err != nil || g64 < 0 {
 		return false, p
 	}
 	pid64, err := strconv.ParseInt(parts[1], 10, 32)
-	if err != nil {
+	if err != nil || pid64 < 0 {
 		return false, p
 	}
 	txn64, err := strconv.ParseUint(parts[2], 10, 64)
@@ -479,10 +500,12 @@ func parseCitusGID(gid string) (bool, parsedGID) {
 	p.groupID = int32(g64)
 	p.pid = int32(pid64)
 	p.transactionNumber = txn64
-	if len(parts) >= 4 {
-		if c, err := strconv.ParseUint(parts[3], 10, 32); err == nil {
-			p.connectionNumber = uint32(c)
+	if len(parts) == 4 {
+		c, err := strconv.ParseUint(parts[3], 10, 32)
+		if err != nil {
+			return false, p
 		}
+		p.connectionNumber = uint32(c)
 	}
 	return true, p
 }
@@ -511,17 +534,18 @@ func buildRecoveryScript(prepared []PreparedXactRow) string {
 	b.WriteString("-- citus-mcp 2PC recovery script\n")
 	b.WriteString("-- Each block below must be executed on the indicated NODE\n")
 	b.WriteString("-- (connect directly; PREPARED xact state is node-local).\n")
+	b.WriteString("-- NOTE: COMMIT PREPARED / ROLLBACK PREPARED cannot run inside\n")
+	b.WriteString("-- a transaction block, so each statement is a standalone command.\n")
 	b.WriteString("-- Safer alternative: run `SELECT recover_prepared_transactions();`\n")
 	b.WriteString("-- on the coordinator — Citus uses the same classification.\n\n")
 	for _, n := range nodes {
 		fmt.Fprintf(&b, "-- === Connect to %s ===\n", n)
 		b.WriteString("-- (psql -h <host> -p <port> -d <database>)\n")
-		b.WriteString("BEGIN;\n")
 		for _, p := range byNode[n] {
-			fmt.Fprintf(&b, "  -- %s (age %.0fs): %s\n", p.Classification, p.AgeSeconds, p.Notes)
-			fmt.Fprintf(&b, "  %s\n", p.RecommendedSQL)
+			fmt.Fprintf(&b, "-- %s (age %.0fs): %s\n", p.Classification, p.AgeSeconds, p.Notes)
+			fmt.Fprintf(&b, "%s\n", p.RecommendedSQL)
 		}
-		b.WriteString("COMMIT;\n\n")
+		b.WriteString("\n")
 	}
 	return b.String()
 }
