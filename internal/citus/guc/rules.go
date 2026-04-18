@@ -53,6 +53,13 @@ type AnalysisContext struct {
 	ShardCount    int
 	TotalRAMBytes int64
 	IsCoordinator bool
+
+	// ExistingReplicationSlots is the currently-allocated slot count on
+	// the coordinator (SELECT count(*) FROM pg_replication_slots). Used
+	// by replication-budget rules so recommendations add on top of slots
+	// the user is already consuming (CDC subscribers, standbys, etc.),
+	// not assume a clean slate. 0 when unmeasured.
+	ExistingReplicationSlots int64
 }
 
 // EvaluateAllRules runs all configuration rules and returns findings.
@@ -216,6 +223,29 @@ func (r *RuleSharedPreloadLibraries) Evaluate(ctx *AnalysisContext) []ConfigFind
 }
 
 // RuleMaxWorkerProcesses checks worker processes are sufficient.
+//
+// PG source: postgres/src/backend/postmaster/bgworker.c —
+// max_worker_processes caps the TOTAL background worker count across
+// everything that registers a bgworker: autovacuum, parallel query,
+// logical replication apply, and any extension workers. Citus adds:
+//
+//   - 1 maintenance daemon per database that has citus loaded
+//     (InitializeMaintenanceDaemon, citus/src/backend/distributed/utils/
+//     maintenanced.c). On most clusters this is 1.
+//   - up to citus.max_background_task_executors_per_node concurrent
+//     background task executors (citus/src/backend/distributed/utils/
+//     background_jobs.c:129 — default 1, range 1..128). Each rebalance
+//     shard move takes one slot.
+//
+// Lower bound formula (citus-only):
+//     citus_min = autovacuum_max_workers           -- PG bgworkers
+//               + max_parallel_workers              -- parallel query
+//               + max_logical_replication_workers   -- apply+sync during moves
+//               + citus.max_background_task_executors_per_node
+//               + 2                                 -- headroom + maintained
+//
+// All those are GUCs; we read their actual values, not a hardcoded
+// "8 + workers*2" which has no source backing.
 type RuleMaxWorkerProcesses struct{}
 
 func (r *RuleMaxWorkerProcesses) ID() string         { return "rule.config.max_worker_processes" }
@@ -225,39 +255,78 @@ func (r *RuleMaxWorkerProcesses) Evaluate(ctx *AnalysisContext) []ConfigFinding 
 	if !ok {
 		return nil
 	}
+	// Defaults match PG 17 / Citus 13+ source where the GUC is absent.
+	avWorkers := gucIntOr(ctx, "autovacuum_max_workers", 3)            // PG postgresql.conf.sample default
+	parWorkers := gucIntOr(ctx, "max_parallel_workers", 8)              // PG default
+	lrWorkers := gucIntOr(ctx, "max_logical_replication_workers", 4)    // PG default
+	bgExec := gucIntOr(ctx, "citus.max_background_task_executors_per_node", 1) // Citus default: shared_library_init.c:2028
+	citusMaint := int64(1)                                              // 1 per DB that has citus
 
-	// Citus needs workers for: maintenance daemon, background tasks, parallel queries
-	// Minimum: 8 + (workers * 2) for a healthy setup
-	minRequired := int64(16)
-	if ctx.WorkerCount > 0 {
-		minRequired = int64(8 + ctx.WorkerCount*2)
+	minRequired := avWorkers + parWorkers + lrWorkers + bgExec + citusMaint + 2
+	if maxWorkers >= minRequired {
+		return nil
 	}
 
-	if maxWorkers < minRequired {
-		severity := SeverityWarning
-		if maxWorkers < 8 {
-			severity = SeverityCritical
-		}
-		return []ConfigFinding{{
-			ID:              r.ID(),
-			Severity:        severity,
-			Category:        r.Category(),
-			Title:           "max_worker_processes may be too low for Citus",
-			Problem:         fmt.Sprintf("max_worker_processes=%d is below recommended %d for a %d-worker cluster", maxWorkers, minRequired, ctx.WorkerCount),
-			Impact:          "Background maintenance, shard rebalancing, and parallel queries may be limited or fail.",
-			Recommendation:  fmt.Sprintf("Set max_worker_processes >= %d", minRequired),
-			CurrentValue:    fmt.Sprintf("%d", maxWorkers),
-			RecommendedVal:  fmt.Sprintf("%d", minRequired),
-			FixSQL:          fmt.Sprintf("ALTER SYSTEM SET max_worker_processes = %d; -- Requires restart", minRequired),
-			RequiresRestart: true,
-			AffectedGUCs:    []string{"max_worker_processes"},
-			Evidence:        map[string]any{"worker_count": ctx.WorkerCount, "min_required": minRequired},
-		}}
+	severity := SeverityWarning
+	// Critical only if we don't even have room for the Citus maintenance
+	// daemon + the bg task executors the user has explicitly asked for.
+	if maxWorkers < (citusMaint + bgExec + 1) {
+		severity = SeverityCritical
 	}
-	return nil
+
+	return []ConfigFinding{{
+		ID:              r.ID(),
+		Severity:        severity,
+		Category:        r.Category(),
+		Title:           "max_worker_processes may be too low for Citus",
+		Problem:         fmt.Sprintf("max_worker_processes=%d is below required %d (autovac=%d + parallel=%d + logrep=%d + citus_bg=%d + citus_maint=%d + headroom=2)", maxWorkers, minRequired, avWorkers, parWorkers, lrWorkers, bgExec, citusMaint),
+		Impact:          "Background maintenance, shard rebalancing, logical replication during shard moves, and parallel queries may be throttled or fail.",
+		Recommendation:  fmt.Sprintf("Set max_worker_processes >= %d", minRequired),
+		CurrentValue:    fmt.Sprintf("%d", maxWorkers),
+		RecommendedVal:  fmt.Sprintf("%d", minRequired),
+		FixSQL:          fmt.Sprintf("ALTER SYSTEM SET max_worker_processes = %d; -- Requires restart", minRequired),
+		RequiresRestart: true,
+		AffectedGUCs:    []string{"max_worker_processes"},
+		Evidence: map[string]any{
+			"autovacuum_max_workers":                          avWorkers,
+			"max_parallel_workers":                            parWorkers,
+			"max_logical_replication_workers":                 lrWorkers,
+			"citus.max_background_task_executors_per_node":    bgExec,
+			"citus_maintenance_daemons":                       citusMaint,
+			"min_required":                                    minRequired,
+		},
+	}}
+}
+
+// gucIntOr returns the GUC's value if set, otherwise the provided default.
+// Keeps rule formulas readable and documents the fall-back constant.
+func gucIntOr(ctx *AnalysisContext, name string, def int64) int64 {
+	if v, ok := ctx.GetGUCInt(name); ok {
+		return v
+	}
+	return def
 }
 
 // RuleMaxReplicationSlots checks replication slots are sufficient.
+//
+// Citus source: citus/src/backend/distributed/replication/
+// multi_logical_replication.c:CreateReplicationSlots — each shard move
+// creates one LOGICAL replication slot per (source, LogicalRepTarget)
+// pair on the SOURCE node. A LogicalRepTarget corresponds to one
+// (target_node, table_owner) pair. For the common single-owner case,
+// that's one slot per concurrent shard move per source node.
+//
+// Concurrent shard moves are capped per node by
+// citus.max_background_task_executors_per_node (default 1; see
+// citus/src/backend/distributed/utils/background_jobs.c:129).
+//
+// Recommended floor: existing user slots already in use + headroom for
+// the rebalancer, with a hard lower bound of bg_executors + 2.
+//
+// The previous "10 + bg_executors*WorkerCount" formula was wrong on
+// two counts: (1) it had a magic floor of 10 with no citation;
+// (2) multiplying by WorkerCount double-counts because each node has
+// its own max_replication_slots cap.
 type RuleMaxReplicationSlots struct{}
 
 func (r *RuleMaxReplicationSlots) ID() string         { return "rule.config.max_replication_slots" }
@@ -267,38 +336,43 @@ func (r *RuleMaxReplicationSlots) Evaluate(ctx *AnalysisContext) []ConfigFinding
 	if !ok {
 		return nil
 	}
+	bgExec := gucIntOr(ctx, "citus.max_background_task_executors_per_node", 1)
+	activeSlots := ctx.ExistingReplicationSlots // measured fact; 0 if unknown
+	// Floor: room for rebalance slots + existing user slots + 2 headroom.
+	minRequired := bgExec + activeSlots + 2
 
-	// Each concurrent shard move uses replication slots
-	// Recommend at least 10 + (background_task_executors * workers)
-	bgExecutors, _ := ctx.GetGUCInt("citus.max_background_task_executors_per_node")
-	if bgExecutors == 0 {
-		bgExecutors = 1
-	}
-	minRequired := int64(10)
-	if ctx.WorkerCount > 0 {
-		minRequired = 10 + bgExecutors*int64(ctx.WorkerCount)
+	if slots >= minRequired {
+		return nil
 	}
 
-	if slots < minRequired {
-		return []ConfigFinding{{
-			ID:              r.ID(),
-			Severity:        SeverityWarning,
-			Category:        r.Category(),
-			Title:           "max_replication_slots may limit shard operations",
-			Problem:         fmt.Sprintf("max_replication_slots=%d, recommend at least %d for parallel shard moves", slots, minRequired),
-			Impact:          "Concurrent shard moves during rebalancing may be limited.",
-			Recommendation:  fmt.Sprintf("Set max_replication_slots >= %d", minRequired),
-			CurrentValue:    fmt.Sprintf("%d", slots),
-			RecommendedVal:  fmt.Sprintf("%d", minRequired),
-			FixSQL:          fmt.Sprintf("ALTER SYSTEM SET max_replication_slots = %d; -- Requires restart", minRequired),
-			RequiresRestart: true,
-			AffectedGUCs:    []string{"max_replication_slots"},
-		}}
-	}
-	return nil
+	return []ConfigFinding{{
+		ID:              r.ID(),
+		Severity:        SeverityWarning,
+		Category:        r.Category(),
+		Title:           "max_replication_slots may limit shard moves",
+		Problem:         fmt.Sprintf("max_replication_slots=%d, recommend at least %d (rebalance bg_executors=%d + existing_slots=%d + headroom=2)", slots, minRequired, bgExec, activeSlots),
+		Impact:          "Shard moves create one logical replication slot per concurrent move on the source; insufficient slots cause move failures mid-rebalance.",
+		Recommendation:  fmt.Sprintf("Set max_replication_slots >= %d", minRequired),
+		CurrentValue:    fmt.Sprintf("%d", slots),
+		RecommendedVal:  fmt.Sprintf("%d", minRequired),
+		FixSQL:          fmt.Sprintf("ALTER SYSTEM SET max_replication_slots = %d; -- Requires restart", minRequired),
+		RequiresRestart: true,
+		AffectedGUCs:    []string{"max_replication_slots"},
+		Evidence: map[string]any{
+			"citus.max_background_task_executors_per_node": bgExec,
+			"existing_active_slots":                        activeSlots,
+			"min_required":                                 minRequired,
+		},
+	}}
 }
 
 // RuleMaxWalSenders checks WAL senders are sufficient.
+//
+// PG source: src/backend/replication/walsender.c — each active slot
+// consumed by a client/subscriber holds one wal_sender. Citus creates
+// a subscription per shard move, so wal_senders must be >= the slot
+// budget used by shard moves + any existing subscribers. Using the
+// same formula as max_replication_slots.
 type RuleMaxWalSenders struct{}
 
 func (r *RuleMaxWalSenders) ID() string         { return "rule.config.max_wal_senders" }
@@ -308,29 +382,33 @@ func (r *RuleMaxWalSenders) Evaluate(ctx *AnalysisContext) []ConfigFinding {
 	if !ok {
 		return nil
 	}
+	bgExec := gucIntOr(ctx, "citus.max_background_task_executors_per_node", 1)
+	activeSlots := ctx.ExistingReplicationSlots
+	minRequired := bgExec + activeSlots + 2
 
-	minRequired := int64(10)
-	if ctx.WorkerCount > 2 {
-		minRequired = int64(ctx.WorkerCount * 3)
+	if senders >= minRequired {
+		return nil
 	}
 
-	if senders < minRequired {
-		return []ConfigFinding{{
-			ID:              r.ID(),
-			Severity:        SeverityWarning,
-			Category:        r.Category(),
-			Title:           "max_wal_senders may limit replication",
-			Problem:         fmt.Sprintf("max_wal_senders=%d, recommend at least %d", senders, minRequired),
-			Impact:          "Logical replication for shard moves may be limited.",
-			Recommendation:  fmt.Sprintf("Set max_wal_senders >= %d", minRequired),
-			CurrentValue:    fmt.Sprintf("%d", senders),
-			RecommendedVal:  fmt.Sprintf("%d", minRequired),
-			FixSQL:          fmt.Sprintf("ALTER SYSTEM SET max_wal_senders = %d; -- Requires restart", minRequired),
-			RequiresRestart: true,
-			AffectedGUCs:    []string{"max_wal_senders"},
-		}}
-	}
-	return nil
+	return []ConfigFinding{{
+		ID:              r.ID(),
+		Severity:        SeverityWarning,
+		Category:        r.Category(),
+		Title:           "max_wal_senders may limit shard-move replication",
+		Problem:         fmt.Sprintf("max_wal_senders=%d, recommend at least %d (rebalance bg_executors=%d + existing_slots=%d + headroom=2)", senders, minRequired, bgExec, activeSlots),
+		Impact:          "Logical replication during shard moves opens one wal_sender per active slot; a low cap stalls moves with 'too many wal senders'.",
+		Recommendation:  fmt.Sprintf("Set max_wal_senders >= %d", minRequired),
+		CurrentValue:    fmt.Sprintf("%d", senders),
+		RecommendedVal:  fmt.Sprintf("%d", minRequired),
+		FixSQL:          fmt.Sprintf("ALTER SYSTEM SET max_wal_senders = %d; -- Requires restart", minRequired),
+		RequiresRestart: true,
+		AffectedGUCs:    []string{"max_wal_senders"},
+		Evidence: map[string]any{
+			"citus.max_background_task_executors_per_node": bgExec,
+			"existing_active_slots":                        activeSlots,
+			"min_required":                                 minRequired,
+		},
+	}}
 }
 
 // =============================================================================

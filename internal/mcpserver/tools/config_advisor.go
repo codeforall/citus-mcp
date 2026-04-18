@@ -104,6 +104,15 @@ func configAdvisorTool(ctx context.Context, deps Dependencies, input ConfigAdvis
 		IsCoordinator: true, // Assume coordinator for now
 	}
 
+	// Measure existing replication-slot usage on the coordinator so
+	// replication-budget rules recommend on top of the slots the user
+	// is already consuming (CDC subscribers, standbys), not assume a
+	// clean slate.
+	var activeSlots int64
+	if err := deps.Pool.QueryRow(ctx, "SELECT count(*) FROM pg_replication_slots").Scan(&activeSlots); err == nil {
+		analysisCtx.ExistingReplicationSlots = activeSlots
+	}
+
 	// Set RAM if provided
 	if input.TotalRAMGB > 0 {
 		analysisCtx.TotalRAMBytes = int64(input.TotalRAMGB) * 1024 * 1024 * 1024

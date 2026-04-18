@@ -324,3 +324,92 @@ local test cluster: `pg_stat_statements` not installed →
 `query_pathology` and `routing_drift` both appear in `tools_skipped`
 with reason `pg_stat_statements_not_installed`, and neither appears
 in `tools_run`.
+
+## config_advisor — replication & worker-process formulas (P0-#5)
+
+**The bug.** Three rules used magic numbers with no source backing:
+
+* `max_worker_processes`: hardcoded floor `8 + WorkerCount*2`, with a
+  magic fallback of 16 when WorkerCount=0 and a critical threshold at
+  the magic value 8. Nothing in Citus or PG says "8".
+* `max_replication_slots`: floor `10 + bg_executors*WorkerCount`. The
+  "10" was unsourced; the multiplication-by-WorkerCount was wrong —
+  each node has its own `max_replication_slots` cap, so multiplying
+  double-counts across the cluster.
+* `max_wal_senders`: `max(10, WorkerCount*3)`. Same two problems.
+
+**The fix.** Replace every constant with a value derived from either
+a cluster fact (a measurable GUC, a `pg_replication_slots` count) or
+a two-slot headroom that is explicitly called out in the evidence.
+
+### max_worker_processes
+
+Derived from what actually registers a background worker at startup:
+
+```
+min = autovacuum_max_workers
+    + max_parallel_workers
+    + max_logical_replication_workers
+    + citus.max_background_task_executors_per_node
+    + 1                                     // citus maintenance daemon
+    + 2                                     // headroom
+```
+
+Source lines:
+
+* PG `src/backend/postmaster/bgworker.c` — one worker slot per registered
+  bgworker; `max_worker_processes` is the global cap.
+* Citus `src/backend/distributed/utils/maintenanced.c` — 1 maintenance
+  daemon per citus-enabled DB.
+* Citus `src/backend/distributed/utils/background_jobs.c:129` —
+  `MaxBackgroundTaskExecutorsPerNode` default 1, range 1..128
+  (`shared_library_init.c:2028`).
+
+Severity: `warning` by default; upgrades to `critical` only if the
+setting doesn't leave room even for `(citus_maint + bg_executors + 1)`.
+
+### max_replication_slots
+
+Slot allocation during shard moves is documented in
+`src/backend/distributed/replication/multi_logical_replication.c:
+CreateReplicationSlots`. Each shard move creates one LOGICAL slot per
+`LogicalRepTarget` on the source. Concurrent moves originating from a
+single node are capped by
+`citus.max_background_task_executors_per_node`. Therefore:
+
+```
+min = citus.max_background_task_executors_per_node
+    + existing_active_slots                 // count(*) from pg_replication_slots
+    + 2                                     // headroom
+```
+
+The advisor now measures `existing_active_slots` on the coordinator
+and adds it to the floor, so we advise ON TOP of what is already
+allocated instead of assuming a clean slate.
+
+### max_wal_senders
+
+Each active slot held by a subscriber consumes one `wal_sender`
+(PG `src/backend/replication/walsender.c`). Uses the same formula as
+`max_replication_slots`.
+
+**Cluster facts that drive this.**
+
+* All six GUCs are read from `pg_settings` on the coordinator.
+* `pg_replication_slots` row count is measured in the advisor.
+* No worker-count multiplier — each node has its own caps.
+
+**Tested.** `internal/citus/guc/rules_magicnumber_test.go` covers:
+
+* Replication-slot floor scales with `bg_executors` AND with
+  `existing_active_slots` (regression against the double-count bug).
+* No false positive when the budget is already adequate.
+* `max_wal_senders` follows the same formula as slots.
+* `max_worker_processes` sums the individual GUCs and scales when the
+  user raises `citus.max_background_task_executors_per_node`.
+
+Live-verified on the test cluster: the rule now emits evidence
+`{autovacuum_max_workers=3, max_parallel_workers=8,
+max_logical_replication_workers=4, citus.max_background_task_executors_per_node=1,
+citus_maintenance_daemons=1, min_required=19}`, every term traceable
+to a GUC or a cited Citus source line.
